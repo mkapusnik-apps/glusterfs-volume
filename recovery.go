@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,10 +17,47 @@ import (
 )
 
 const mountInfoPath = "/proc/self/mountinfo"
+const internalMountProbeArgument = "--internal-mount-health-probe"
+const startupRecoveryTimeout = 30 * time.Second
+const requestOperationTimeout = 60 * time.Second
+const defaultMountProbeTimeout = 3 * time.Second
+const rollbackOperationTimeout = 10 * time.Second
+
+const (
+	probeExitHealthy = iota
+	probeExitNotConnected
+	probeExitStale
+	probeExitIO
+	probeExitOther
+)
+
+type mountInfoReader interface {
+	read(context.Context) ([]mountRecord, error)
+}
+
+type mountHealthProbe interface {
+	probe(context.Context, string) error
+}
+
+type procMountInfoReader struct {
+	path string
+}
+
+type subprocessMountHealthProbe struct {
+	timeout time.Duration
+}
 
 type mountRecord struct {
-	target     string
-	filesystem string
+	mountID        int
+	parentID       int
+	majorMinor     string
+	root           string
+	target         string
+	mountOptions   string
+	optionalFields string
+	filesystem     string
+	source         string
+	superOptions   string
 }
 
 type recoveryFailure struct {
@@ -52,8 +91,8 @@ func newRecoveryFailure(volumeName, target, condition, result string, cause erro
 	}
 }
 
-func readMountInfo() ([]mountRecord, error) {
-	file, err := os.Open(mountInfoPath)
+func (r procMountInfoReader) read(ctx context.Context) ([]mountRecord, error) {
+	file, err := os.Open(r.path)
 	if err != nil {
 		return nil, fmt.Errorf("open mount information: %w", err)
 	}
@@ -62,28 +101,63 @@ func readMountInfo() ([]mountRecord, error) {
 	var records []mountRecord
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		parts := strings.SplitN(scanner.Text(), " - ", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid mountinfo entry %q", scanner.Text())
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("read mount information: %w", err)
 		}
-		left := strings.Fields(parts[0])
-		right := strings.Fields(parts[1])
-		if len(left) < 5 || len(right) < 2 {
-			return nil, fmt.Errorf("incomplete mountinfo entry %q", scanner.Text())
-		}
-		target, err := unescapeMountInfoField(left[4])
+		record, err := parseMountInfoLine(scanner.Text())
 		if err != nil {
-			return nil, fmt.Errorf("decode mount target %q: %w", left[4], err)
+			return nil, err
 		}
-		records = append(records, mountRecord{
-			target:     target,
-			filesystem: right[0],
-		})
+		records = append(records, record)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("read mount information: %w", err)
 	}
 	return records, nil
+}
+
+func parseMountInfoLine(line string) (mountRecord, error) {
+	parts := strings.SplitN(line, " - ", 2)
+	if len(parts) != 2 {
+		return mountRecord{}, fmt.Errorf("invalid mountinfo entry %q", line)
+	}
+	left := strings.Fields(parts[0])
+	right := strings.Fields(parts[1])
+	if len(left) < 6 || len(right) < 3 {
+		return mountRecord{}, fmt.Errorf("incomplete mountinfo entry %q", line)
+	}
+	mountID, err := strconv.Atoi(left[0])
+	if err != nil {
+		return mountRecord{}, fmt.Errorf("invalid mount ID %q: %w", left[0], err)
+	}
+	parentID, err := strconv.Atoi(left[1])
+	if err != nil {
+		return mountRecord{}, fmt.Errorf("invalid parent mount ID %q: %w", left[1], err)
+	}
+	root, err := unescapeMountInfoField(left[3])
+	if err != nil {
+		return mountRecord{}, fmt.Errorf("decode mount root %q: %w", left[3], err)
+	}
+	target, err := unescapeMountInfoField(left[4])
+	if err != nil {
+		return mountRecord{}, fmt.Errorf("decode mount target %q: %w", left[4], err)
+	}
+	source, err := unescapeMountInfoField(right[1])
+	if err != nil {
+		return mountRecord{}, fmt.Errorf("decode mount source %q: %w", right[1], err)
+	}
+	return mountRecord{
+		mountID:        mountID,
+		parentID:       parentID,
+		majorMinor:     left[2],
+		root:           root,
+		target:         target,
+		mountOptions:   left[5],
+		optionalFields: strings.Join(left[6:], " "),
+		filesystem:     right[0],
+		source:         source,
+		superOptions:   strings.Join(right[2:], " "),
+	}, nil
 }
 
 func unescapeMountInfoField(value string) (string, error) {
@@ -94,7 +168,7 @@ func unescapeMountInfoField(value string) (string, error) {
 			continue
 		}
 		if index+3 >= len(value) {
-			return "", fmt.Errorf("truncated escape")
+			return "", errors.New("truncated escape")
 		}
 		decoded, err := strconv.ParseUint(value[index+1:index+4], 8, 8)
 		if err != nil {
@@ -121,8 +195,101 @@ func recordsForTarget(records []mountRecord, target string) (exact []mountRecord
 	return exact, descendants
 }
 
-func isManagedGlusterMount(record mountRecord) bool {
-	return record.filesystem == "fuse.glusterfs"
+func (r mountRecord) sameIdentity(other mountRecord) bool {
+	return r.mountID == other.mountID &&
+		r.parentID == other.parentID &&
+		r.majorMinor == other.majorMinor &&
+		r.root == other.root &&
+		r.target == other.target &&
+		r.mountOptions == other.mountOptions &&
+		r.optionalFields == other.optionalFields &&
+		r.filesystem == other.filesystem &&
+		r.source == other.source &&
+		r.superOptions == other.superOptions
+}
+
+func expectedMountSources(state volumeState, subdir string) []string {
+	sources := make([]string, 0, len(state.Servers))
+	for _, server := range state.Servers {
+		source := server + ":" + state.Volume
+		if subdir != "" {
+			source += "/" + subdir
+		}
+		sources = append(sources, source)
+	}
+	return sources
+}
+
+func recordMatchesExpected(record mountRecord, state volumeState, subdir string) bool {
+	if record.filesystem != "fuse.glusterfs" || record.root != "/" || !hasMountOption(record.mountOptions, "rw") || !hasMountOption(record.superOptions, "rw") {
+		return false
+	}
+	for _, source := range expectedMountSources(state, subdir) {
+		if record.source == source {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMountOption(options, expected string) bool {
+	for _, option := range strings.Split(options, ",") {
+		if option == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func (p subprocessMountHealthProbe) probe(parent context.Context, target string) error {
+	timeout := p.timeout
+	if timeout <= 0 {
+		timeout = defaultMountProbeTimeout
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/proc/self/exe", internalMountProbeArgument, target)
+	cmd.WaitDelay = time.Second
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return fmt.Errorf("mount health probe exceeded %s: %w", timeout, ctx.Err())
+	}
+	if err == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return fmt.Errorf("run mount health probe: %w", err)
+	}
+	switch exitErr.ExitCode() {
+	case probeExitNotConnected:
+		return syscall.ENOTCONN
+	case probeExitStale:
+		return syscall.ESTALE
+	case probeExitIO:
+		return syscall.EIO
+	default:
+		return fmt.Errorf("mount health probe exited with status %d", exitErr.ExitCode())
+	}
+}
+
+func runInternalMountProbe(target string) int {
+	if !isLexicallyBeneath(propagatedMount, target) {
+		return probeExitOther
+	}
+	err := probeMountedDirectory(target)
+	switch {
+	case err == nil:
+		return probeExitHealthy
+	case errors.Is(err, syscall.ENOTCONN):
+		return probeExitNotConnected
+	case errors.Is(err, syscall.ESTALE):
+		return probeExitStale
+	case errors.Is(err, syscall.EIO):
+		return probeExitIO
+	default:
+		return probeExitOther
+	}
 }
 
 func probeMountedDirectory(target string) error {
@@ -146,9 +313,25 @@ func (d *glusterfsDriver) reconcileStartup() {
 	d.Lock()
 	defer d.Unlock()
 
-	for name := range d.volumes {
-		target := d.mountpoint(name)
-		mounted, err := d.reconcileTarget(name, target)
+	ctx, cancel := context.WithTimeout(context.Background(), startupRecoveryTimeout)
+	defer cancel()
+	for name, state := range d.volumes {
+		target, err := d.validatedTarget(name, state)
+		if err != nil {
+			d.recoveryIssues[name] = err
+			log.Printf("Startup recovery blocked: %v", err)
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			recoveryErr := newRecoveryFailure(
+				name, target, "startup recovery deadline reached", "performed no operation for this volume",
+				err, "reduce blocked mount operations or resolve earlier recovery failures, then restart",
+			)
+			d.recoveryIssues[name] = recoveryErr
+			log.Printf("Startup recovery blocked: %v", recoveryErr)
+			continue
+		}
+		mounted, err := d.reconcileTarget(ctx, name, target, state)
 		if err != nil {
 			d.recoveryIssues[name] = err
 			log.Printf("Startup recovery blocked: %v", err)
@@ -161,10 +344,10 @@ func (d *glusterfsDriver) reconcileStartup() {
 				createdAt:  time.Now().UTC(),
 				ids:        map[string]int{},
 			}
-			log.Printf("Startup recovery volume %q target %q: detected one usable managed mount; recovery result: preserved for request reuse", name, target)
+			log.Printf("Startup recovery volume %q target %q: detected one healthy mount with the configured identity; recovery result: preserved for request reuse", name, target)
 			continue
 		}
-		if err := d.prepareMountpoint(name, target); err != nil {
+		if err := d.prepareMountpoint(name, target, state); err != nil {
 			d.recoveryIssues[name] = err
 			log.Printf("Startup recovery blocked: %v", err)
 			continue
@@ -172,18 +355,21 @@ func (d *glusterfsDriver) reconcileStartup() {
 		log.Printf("Startup recovery volume %q target %q: recovery result: ready without a physical mount", name, target)
 	}
 
-	d.warnUnknownMounts()
+	d.warnUnknownMounts(ctx)
 }
 
-func (d *glusterfsDriver) warnUnknownMounts() {
-	records, err := readMountInfo()
+func (d *glusterfsDriver) warnUnknownMounts(ctx context.Context) {
+	records, err := d.mountInfo.read(ctx)
 	if err != nil {
 		log.Printf("Startup recovery could not scan for unknown mounts under %q: %v; next action: inspect mountinfo before using a conflicting target", d.root, err)
 		return
 	}
 	known := make(map[string]struct{}, len(d.volumes))
-	for name := range d.volumes {
-		known[filepath.Clean(d.mountpoint(name))] = struct{}{}
+	for name, state := range d.volumes {
+		target, err := d.validatedTarget(name, state)
+		if err == nil {
+			known[target] = struct{}{}
+		}
 	}
 	root := filepath.Clean(d.root)
 	prefix := root + string(os.PathSeparator)
@@ -199,10 +385,20 @@ func (d *glusterfsDriver) warnUnknownMounts() {
 	}
 }
 
-func (d *glusterfsDriver) reconcileTarget(volumeName, target string) (bool, error) {
-	records, err := readMountInfo()
+func (d *glusterfsDriver) reconcileTarget(ctx context.Context, volumeName, target string, state volumeState) (bool, error) {
+	validatedTarget, err := d.validatedTarget(volumeName, state)
 	if err != nil {
-		return false, newRecoveryFailure(volumeName, target, "unreadable mount table", "no changes made", err, "restore access to /proc/self/mountinfo and retry")
+		return false, err
+	}
+	if validatedTarget != target {
+		return false, newRecoveryFailure(
+			volumeName, target, "target does not match validated confinement", "performed no mount operation",
+			fmt.Errorf("validated target is %q", validatedTarget), "retry with the validated persisted definition",
+		)
+	}
+	records, err := d.mountInfo.read(ctx)
+	if err != nil {
+		return false, newRecoveryFailure(volumeName, target, "unreadable mount table", "made no changes", err, "restore access to /proc/self/mountinfo and retry")
 	}
 	exact, descendants := recordsForTarget(records, target)
 	if len(descendants) > 0 {
@@ -215,66 +411,79 @@ func (d *glusterfsDriver) reconcileTarget(volumeName, target string) (bool, erro
 	if len(exact) == 0 {
 		return false, nil
 	}
-	for _, record := range exact {
-		if !isManagedGlusterMount(record) {
-			return false, newRecoveryFailure(
-				volumeName, target, "conflicting unknown mount", "preserved the mount",
-				fmt.Errorf("filesystem %q is not a managed GlusterFS mount", record.filesystem),
-				"unmount or relocate the conflicting mount manually, then retry",
-			)
-		}
-	}
 	if len(exact) > 1 {
-		condition := fmt.Sprintf("%d duplicate managed GlusterFS mounts", len(exact))
-		if err := d.detachManagedMounts(volumeName, target, len(exact), condition); err != nil {
-			return false, err
+		matching := 0
+		for _, record := range exact {
+			if recordMatchesExpected(record, state, state.Subdir) {
+				matching++
+			}
 		}
-		log.Printf("Recovery volume %q target %q: detected %s; recovery result: lazily detached all duplicates; next action: retry mounts normally", volumeName, target, condition)
-		return false, nil
+		return false, newRecoveryFailure(
+			volumeName, target, "ambiguous duplicate mount stack", "preserved every mount to avoid disrupting active or unknown users",
+			fmt.Errorf("found %d mount(s), of which %d match the configured identity", len(exact), matching),
+			"inspect the target mount stack and remove conflicts manually, then retry",
+		)
 	}
-	if err := probeMountedDirectory(target); err != nil {
+	record := exact[0]
+	if !recordMatchesExpected(record, state, state.Subdir) {
+		return false, newRecoveryFailure(
+			volumeName, target, "conflicting or temporary mount identity", "preserved the mount and refused to adopt it",
+			fmt.Errorf("found filesystem %q source %q root %q; expected one of %q", record.filesystem, record.source, record.root, expectedMountSources(state, state.Subdir)),
+			"verify whether this is a crash-surviving temporary or unknown mount, unmount it manually if safe, then retry",
+		)
+	}
+	if err := d.healthProbe.probe(ctx, target); err != nil {
 		if !isStaleMountError(err) {
 			return false, newRecoveryFailure(
-				volumeName, target, "managed mount with indeterminate health", "preserved the mount",
-				err, "restore access to the mounted directory or unmount it manually, then retry",
+				volumeName, target, "intended mount with unproven health", "preserved the mount and returned no path",
+				err, "restore bounded probe access or unmount the target manually, then retry",
 			)
 		}
-		condition := fmt.Sprintf("disconnected or stale managed GlusterFS mount (%v)", err)
-		if err := d.detachManagedMounts(volumeName, target, 1, condition); err != nil {
+		condition := fmt.Sprintf("disconnected or stale intended GlusterFS mount (%v)", err)
+		if err := d.detachExactMount(ctx, volumeName, target, record, condition); err != nil {
 			return false, err
 		}
-		log.Printf("Recovery volume %q target %q: detected %s; recovery result: lazily detached the stale mount; next action: retry mounts normally", volumeName, target, condition)
+		log.Printf("Recovery volume %q target %q: detected %s; recovery result: lazily detached the proven intended mount; next action: retry mounts normally", volumeName, target, condition)
 		return false, nil
 	}
 	return true, nil
 }
 
-func (d *glusterfsDriver) detachManagedMounts(volumeName, target string, count int, condition string) error {
-	for detached := 0; detached < count; detached++ {
-		if err := d.client.unmountLazy(target); err != nil {
-			return newRecoveryFailure(
-				volumeName, target, condition,
-				fmt.Sprintf("detached %d of %d managed mount(s)", detached, count),
-				err, "resolve processes or kernel state holding the target, then retry",
-			)
-		}
-	}
-	records, err := readMountInfo()
+func (d *glusterfsDriver) detachExactMount(ctx context.Context, volumeName, target string, expected mountRecord, condition string) error {
+	records, err := d.mountInfo.read(ctx)
 	if err != nil {
-		return newRecoveryFailure(volumeName, target, condition, "detach commands completed but verification failed", err, "inspect the target mount state manually before retrying")
+		return newRecoveryFailure(volumeName, target, condition, "made no changes because identity revalidation failed", err, "inspect the target mount state manually before retrying")
 	}
-	exact, _ := recordsForTarget(records, target)
-	if len(exact) != 0 {
+	exact, descendants := recordsForTarget(records, target)
+	if len(descendants) > 0 || len(exact) != 1 || !exact[0].sameIdentity(expected) {
 		return newRecoveryFailure(
-			volumeName, target, condition, "detach verification found remaining mount state",
-			fmt.Errorf("%d mount(s) remain at the target", len(exact)),
-			"inspect and resolve the target mount stack manually, then retry",
+			volumeName, target, condition, "preserved changed or ambiguous mount state",
+			fmt.Errorf("identity revalidation found %d exact and %d nested mount(s)", len(exact), len(descendants)),
+			"inspect the target mount stack manually, then retry",
 		)
+	}
+	if err := d.client.unmountLazy(ctx, target); err != nil {
+		return newRecoveryFailure(volumeName, target, condition, "failed to detach the proven mount", err, "resolve processes or kernel state holding the target, then retry")
+	}
+	records, err = d.mountInfo.read(ctx)
+	if err != nil {
+		return newRecoveryFailure(volumeName, target, condition, "detach completed but verification failed", err, "inspect the target mount state manually before retrying")
+	}
+	exact, _ = recordsForTarget(records, target)
+	if len(exact) != 0 {
+		return newRecoveryFailure(volumeName, target, condition, "detach verification found remaining mount state", fmt.Errorf("%d mount(s) remain", len(exact)), "inspect the target mount stack manually, then retry")
 	}
 	return nil
 }
 
-func (d *glusterfsDriver) prepareMountpoint(volumeName, target string) error {
+func (d *glusterfsDriver) prepareMountpoint(volumeName, target string, state volumeState) error {
+	validatedTarget, err := d.validatedTarget(volumeName, state)
+	if err != nil {
+		return err
+	}
+	if validatedTarget != target {
+		return newRecoveryFailure(volumeName, target, "target failed confinement revalidation", "made no filesystem change", fmt.Errorf("validated target is %q", validatedTarget), "correct the persisted definition and retry")
+	}
 	info, err := os.Lstat(target)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := os.MkdirAll(target, defaultMode); err != nil {
@@ -283,14 +492,10 @@ func (d *glusterfsDriver) prepareMountpoint(volumeName, target string) error {
 		return nil
 	}
 	if err != nil {
-		return newRecoveryFailure(volumeName, target, "unreadable mountpoint path", "no changes made", err, "restore access to the target path, then retry")
+		return newRecoveryFailure(volumeName, target, "unreadable mountpoint path", "made no changes", err, "restore access to the target path, then retry")
 	}
 	if !info.IsDir() {
-		return newRecoveryFailure(
-			volumeName, target, "incompatible mountpoint object", "preserved the object",
-			fmt.Errorf("target mode is %s", info.Mode()),
-			"move or remove the incompatible object manually without losing local data, then retry",
-		)
+		return newRecoveryFailure(volumeName, target, "incompatible mountpoint object", "preserved the object", fmt.Errorf("target mode is %s", info.Mode()), "move or remove the incompatible object manually without losing local data, then retry")
 	}
 	directory, err := os.Open(target)
 	if err != nil {
@@ -307,76 +512,122 @@ func (d *glusterfsDriver) prepareMountpoint(volumeName, target string) error {
 	return nil
 }
 
-func (d *glusterfsDriver) mountPhysical(volumeName, target string, state volumeState) error {
+func (d *glusterfsDriver) mountPhysical(ctx context.Context, volumeName, target string, state volumeState) error {
 	if state.Subdir != "" {
-		if err := d.mountAndVerify(volumeName, target, state.Volume, state.Servers, "", "preparing the GlusterFS subdirectory"); err != nil {
+		if err := d.mountAndVerify(ctx, volumeName, target, state, "", "preparing the GlusterFS subdirectory"); err != nil {
 			return err
 		}
-		if err := os.MkdirAll(filepath.Join(target, state.Subdir), defaultMode); err != nil {
-			return d.failedMountCleanup(volumeName, target, "failed to prepare the GlusterFS subdirectory", err)
+		subdirTarget := filepath.Join(target, state.Subdir)
+		if err := os.MkdirAll(subdirTarget, defaultMode); err != nil {
+			return d.rollbackExpectedMount(ctx, volumeName, target, state, "", "failed to prepare the GlusterFS subdirectory", err)
 		}
-		if err := d.unmountPhysical(volumeName, target); err != nil {
+		if err := d.unmountPhysical(ctx, volumeName, target, state, ""); err != nil {
 			return err
 		}
 	}
-	return d.mountAndVerify(volumeName, target, state.Volume, state.Servers, state.Subdir, "mounting the requested GlusterFS path")
+	return d.mountAndVerify(ctx, volumeName, target, state, state.Subdir, "mounting the requested GlusterFS path")
 }
 
-func (d *glusterfsDriver) mountAndVerify(volumeName, target, volume string, servers []string, subdir, operation string) error {
-	if err := d.client.mountWithGlusterfs(target, volume, servers, subdir); err != nil {
-		return d.failedMountCleanup(volumeName, target, operation, err)
-	}
-	mounted, err := d.reconcileTarget(volumeName, target)
+func (d *glusterfsDriver) mountAndVerify(ctx context.Context, volumeName, target string, state volumeState, subdir, operation string) error {
+	records, err := d.mountInfo.read(ctx)
 	if err != nil {
-		return err
+		return newRecoveryFailure(volumeName, target, operation, "did not start the mount command", err, "restore mountinfo access, then retry")
 	}
-	if !mounted {
+	exact, descendants := recordsForTarget(records, target)
+	if len(exact) != 0 || len(descendants) != 0 {
+		return newRecoveryFailure(volumeName, target, operation, "did not start the mount command and preserved existing state", fmt.Errorf("found %d exact and %d nested mount(s)", len(exact), len(descendants)), "resolve conflicting mounts, then retry")
+	}
+	if err := d.client.mountWithGlusterfs(ctx, target, state.Volume, state.Servers, subdir); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), rollbackOperationTimeout)
+		defer cancel()
+		return d.cleanupAfterMountCommand(cleanupCtx, volumeName, target, operation, err)
+	}
+	records, err = d.mountInfo.read(ctx)
+	if err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), rollbackOperationTimeout)
+		defer cancel()
+		rollbackErr := d.client.unmountLazy(cleanupCtx, target)
+		result := "mount command succeeded; rollback was attempted because mountinfo verification failed"
+		cause := fmt.Errorf("verify mount identity: %w", err)
+		if rollbackErr != nil {
+			result = "mount command succeeded but rollback also failed"
+			cause = fmt.Errorf("%w; rollback cause: %v", cause, rollbackErr)
+		}
+		return newRecoveryFailure(volumeName, target, operation, result, cause, "inspect the target and clear any residual intended mount before retrying")
+	}
+	exact, descendants = recordsForTarget(records, target)
+	if len(descendants) != 0 || len(exact) > 1 {
 		return newRecoveryFailure(
-			volumeName, target, "mount command reported success without one usable physical mount",
-			"removed any duplicate or stale managed mount state", errors.New("post-mount verification failed"),
-			"inspect GlusterFS client logs and connectivity, then retry",
+			volumeName, target, operation, "preserved an ambiguous post-mount stack rather than disrupting unknown users",
+			fmt.Errorf("verification found %d exact and %d nested mount(s)", len(exact), len(descendants)),
+			"inspect the target mount stack, remove conflicts manually, then retry",
 		)
+	}
+	if len(exact) == 0 {
+		return newRecoveryFailure(volumeName, target, operation, "no physical mount was recorded and no logical reference was added", errors.New("mount command reported success without a mountinfo entry"), "inspect GlusterFS client logs and connectivity, then retry")
+	}
+	record := exact[0]
+	if !recordMatchesExpected(record, state, subdir) {
+		return d.rollbackRecord(ctx, volumeName, target, record, operation, fmt.Errorf("mounted identity source %q does not match expected sources %q", record.source, expectedMountSources(state, subdir)))
+	}
+	if err := d.healthProbe.probe(ctx, target); err != nil {
+		return d.rollbackRecord(ctx, volumeName, target, record, operation, fmt.Errorf("post-mount health verification failed: %w", err))
 	}
 	return nil
 }
 
-func (d *glusterfsDriver) failedMountCleanup(volumeName, target, condition string, mountErr error) error {
-	records, inspectErr := readMountInfo()
+func (d *glusterfsDriver) cleanupAfterMountCommand(ctx context.Context, volumeName, target, operation string, mountErr error) error {
+	records, inspectErr := d.mountInfo.read(ctx)
 	if inspectErr != nil {
-		cause := fmt.Errorf("%w; residual mount inspection also failed: %v", mountErr, inspectErr)
-		return newRecoveryFailure(volumeName, target, condition, "could not inspect residual mount state", cause, "inspect and clear the target manually before retrying")
+		return newRecoveryFailure(volumeName, target, operation, "mount command failed and residual state could not be inspected", fmt.Errorf("%w; mountinfo cause: %v", mountErr, inspectErr), "inspect and clear any residual mount manually before retrying")
 	}
 	exact, descendants := recordsForTarget(records, target)
-	if len(descendants) > 0 {
-		return newRecoveryFailure(volumeName, target, condition, "preserved unknown nested mounts", mountErr, "resolve the mount failure and nested mounts manually, then retry")
+	if len(descendants) != 0 || len(exact) > 1 {
+		return newRecoveryFailure(volumeName, target, operation, "mount command failed; preserved ambiguous residual state", fmt.Errorf("%w; found %d exact and %d nested mount(s)", mountErr, len(exact), len(descendants)), "inspect the target mount stack manually, then retry")
 	}
 	if len(exact) == 0 {
-		return newRecoveryFailure(volumeName, target, condition, "no residual physical mount remains; state is retryable", mountErr, "resolve the GlusterFS cause and retry")
+		return newRecoveryFailure(volumeName, target, operation, "no residual physical mount remains; state is retryable", mountErr, "resolve the GlusterFS cause and retry")
 	}
-	for _, record := range exact {
-		if !isManagedGlusterMount(record) {
-			return newRecoveryFailure(volumeName, target, condition, "preserved a conflicting unknown mount", mountErr, "resolve the GlusterFS failure and conflicting mount manually, then retry")
-		}
-	}
-	if err := d.detachManagedMounts(volumeName, target, len(exact), condition); err != nil {
-		cause := fmt.Errorf("%w; residual mount cleanup also failed: %v", mountErr, err)
-		return newRecoveryFailure(volumeName, target, condition, "residual managed mount cleanup failed", cause, "clear the target mount state manually, then retry")
-	}
-	return newRecoveryFailure(volumeName, target, condition, "detached residual managed mount state; state is retryable", mountErr, "resolve the GlusterFS cause and retry")
+	return d.rollbackRecord(ctx, volumeName, target, exact[0], operation, mountErr)
 }
 
-func (d *glusterfsDriver) unmountPhysical(volumeName, target string) error {
-	mounted, err := d.reconcileTarget(volumeName, target)
+func (d *glusterfsDriver) rollbackExpectedMount(ctx context.Context, volumeName, target string, state volumeState, subdir, operation string, cause error) error {
+	records, err := d.mountInfo.read(ctx)
+	if err != nil {
+		return newRecoveryFailure(volumeName, target, operation, "could not inspect the owned mount for rollback", fmt.Errorf("%w; mountinfo cause: %v", cause, err), "inspect and clear the target manually before retrying")
+	}
+	exact, descendants := recordsForTarget(records, target)
+	if len(exact) != 1 || len(descendants) != 0 || !recordMatchesExpected(exact[0], state, subdir) {
+		return newRecoveryFailure(volumeName, target, operation, "preserved changed or ambiguous state during rollback", cause, "inspect the target mount stack manually, then retry")
+	}
+	return d.rollbackRecord(ctx, volumeName, target, exact[0], operation, cause)
+}
+
+func (d *glusterfsDriver) rollbackRecord(ctx context.Context, volumeName, target string, record mountRecord, operation string, cause error) error {
+	cleanupCtx := ctx
+	cancel := func() {}
+	if ctx.Err() != nil {
+		cleanupCtx, cancel = context.WithTimeout(context.Background(), rollbackOperationTimeout)
+	}
+	defer cancel()
+	if err := d.detachExactMount(cleanupCtx, volumeName, target, record, operation); err != nil {
+		return newRecoveryFailure(volumeName, target, operation, "owned partial mount rollback failed", fmt.Errorf("%w; rollback cause: %v", cause, err), "clear the target mount state manually, then retry")
+	}
+	return newRecoveryFailure(volumeName, target, operation, "detached the single command-created mount; state is retryable", cause, "resolve the GlusterFS cause and retry")
+}
+
+func (d *glusterfsDriver) unmountPhysical(ctx context.Context, volumeName, target string, state volumeState, subdir string) error {
+	mounted, err := d.reconcileExpectedTarget(ctx, volumeName, target, state, subdir)
 	if err != nil {
 		return err
 	}
 	if !mounted {
 		return nil
 	}
-	if err := d.client.unmount(target); err != nil {
+	if err := d.client.unmount(ctx, target); err != nil {
 		return newRecoveryFailure(volumeName, target, "last logical reference release", "physical unmount failed and logical reference was preserved", err, "resolve users holding the mount and retry the unmount")
 	}
-	records, err := readMountInfo()
+	records, err := d.mountInfo.read(ctx)
 	if err != nil {
 		return newRecoveryFailure(volumeName, target, "completed physical unmount", "could not verify the target", err, "inspect the target before retrying")
 	}
@@ -385,4 +636,41 @@ func (d *glusterfsDriver) unmountPhysical(volumeName, target string) error {
 		return newRecoveryFailure(volumeName, target, "completed physical unmount", "verification found remaining mount state", fmt.Errorf("%d mount(s) remain", len(exact)), "inspect the target mount stack manually, then retry")
 	}
 	return nil
+}
+
+func (d *glusterfsDriver) reconcileExpectedTarget(ctx context.Context, volumeName, target string, state volumeState, subdir string) (bool, error) {
+	validatedTarget, err := d.validatedTarget(volumeName, state)
+	if err != nil {
+		return false, err
+	}
+	if validatedTarget != target {
+		return false, newRecoveryFailure(volumeName, target, "target failed confinement revalidation", "made no mount change", fmt.Errorf("validated target is %q", validatedTarget), "correct the persisted definition and retry")
+	}
+	if subdir == state.Subdir {
+		return d.reconcileTarget(ctx, volumeName, target, state)
+	}
+	records, err := d.mountInfo.read(ctx)
+	if err != nil {
+		return false, newRecoveryFailure(volumeName, target, "unreadable mount table", "made no changes", err, "restore mountinfo access and retry")
+	}
+	exact, descendants := recordsForTarget(records, target)
+	if len(descendants) != 0 || len(exact) > 1 {
+		return false, newRecoveryFailure(volumeName, target, "ambiguous temporary mount state", "preserved all mounts", fmt.Errorf("found %d exact and %d nested mount(s)", len(exact), len(descendants)), "inspect the target mount stack manually, then retry")
+	}
+	if len(exact) == 0 {
+		return false, nil
+	}
+	if !recordMatchesExpected(exact[0], state, subdir) {
+		return false, newRecoveryFailure(volumeName, target, "temporary mount identity mismatch", "preserved the mount", fmt.Errorf("source %q does not match expected sources %q", exact[0].source, expectedMountSources(state, subdir)), "inspect and resolve the target manually, then retry")
+	}
+	if err := d.healthProbe.probe(ctx, target); err != nil {
+		if isStaleMountError(err) {
+			if err := d.detachExactMount(ctx, volumeName, target, exact[0], "stale temporary mount"); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+		return false, newRecoveryFailure(volumeName, target, "temporary mount with unproven health", "preserved the mount", err, "restore probe access or inspect the target manually, then retry")
+	}
+	return true, nil
 }

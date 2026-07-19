@@ -13,16 +13,37 @@ For each valid definition in `volumes.json`, the plugin reads
 | Detected state | Outcome |
 | --- | --- |
 | No mount | The mountpoint directory is prepared and the volume remains unmounted until requested. |
-| One responsive `fuse.glusterfs` mount at the exact managed target | The physical mount is preserved and can be reused by the next successful request. |
+| One responsive `fuse.glusterfs` mount with the configured source identity at the exact managed target | The physical mount is preserved and can be reused by the next successful request. |
 | A disconnected or stale managed mount reporting `ENOTCONN`, `ESTALE`, or `EIO` | The mount is lazily detached. A later request creates and verifies a fresh mount. |
-| Duplicate managed GlusterFS mounts at the exact target | All stacked duplicates are lazily detached so a later request can create one verified mount. |
+| Duplicate mounts at the exact target | The ambiguous stack is preserved and the volume is blocked so recovery cannot disrupt healthy or unknown users. An operator must resolve the stack. |
 | An incompatible object, unknown filesystem, nested mount, unreadable state, or failed recovery | The volume is blocked with a diagnostic. Other volumes and plugin requests continue to work. |
+| An invalid persisted name, volume, subdirectory, server, or target | No target is constructed and no filesystem or mount operation is attempted for that definition. |
 
 Every new physical mount is checked against mountinfo and probed as a directory before
 the request succeeds. A successful mount command without exactly one responsive
 physical mount is treated as a failure. Residual managed state from a failed attempt is
 detached when it is safe to identify; logical state is not recorded for the failed
 request, so the request remains retryable.
+
+When a mount command creates one identifiable mount but post-mount identity or health
+verification fails, the plugin revalidates the full mountinfo record and lazily rolls
+that command-created mount back. If concurrent or duplicate records make ownership
+ambiguous, it preserves the stack and reports the required manual action instead of
+blindly unmounting another user's filesystem.
+
+Mount identity includes the mount ID and parent, device, root, target, mount and super
+options, filesystem type, and source retained from mountinfo. Reuse additionally
+requires `fuse.glusterfs`, a read-write root, and the Gluster source derived from one of
+the configured servers plus the exact volume and subdirectory. A whole-volume mount
+left by interrupted subdirectory preparation therefore cannot be returned as the
+configured subdirectory. If identity or ownership is ambiguous, the plugin preserves
+the mount and fails only that volume with operator guidance.
+
+Health checks run in a killable helper process with a three-second per-probe deadline.
+Startup reconciliation has a 30-second overall deadline plus a bounded helper-process
+termination allowance and completes, recording actionable unavailable outcomes for
+unfinished volumes, before the plugin socket opens. Mount and unmount commands are also
+context-bounded. A timeout never counts as proof of mount health.
 
 The same behavior applies to whole-volume and subdirectory-backed definitions. For a
 subdirectory definition, the plugin temporarily mounts the volume root to ensure the
@@ -41,6 +62,12 @@ only requests for that volume until an operator moves or removes the object manu
 The plugin also preserves unknown or nested mounts rather than hiding or detaching
 them.
 
+Persisted definitions are validated before mountinfo matching, probing, directory
+creation, mounting, or unmounting. Volume keys must resolve to one safe child of the
+managed root; persisted names must match their map keys; and volume, subdirectory, and
+server fields must be safe relative values. Invalid legacy or corrupt definitions are
+reported but cannot cause inspection or mutation outside the managed root.
+
 ## Logical references
 
 All successful Docker `Mount` calls for a volume share one verified physical mount.
@@ -57,12 +84,12 @@ the surviving physical state.
 
 ## Unknown mounts
 
-The ownership boundary is an exact target derived from a persisted volume name. A
-`fuse.glusterfs` mount at that exact target is treated as managed recovery state.
-Mounts at targets that have no persisted definition, mounts below a managed target, and
-non-GlusterFS mounts at a managed target are unknown. The plugin warns about and
-preserves unknown mounts. It rejects only requests whose target conflicts with them;
-unrelated volumes continue to operate.
+The ownership boundary is an exact, validated target derived from a persisted volume
+name plus the expected GlusterFS source identity. A mount at the target with a different
+volume, subdirectory, filesystem, root, or access mode is unknown. Mounts at targets
+that have no valid persisted definition and mounts below a managed target are also
+unknown. The plugin warns about and preserves unknown mounts. It rejects only requests
+whose target conflicts with them; unrelated volumes continue to operate.
 
 The plugin never scans, cleans, or unmounts paths outside its managed root.
 
@@ -101,5 +128,8 @@ Starting GlusterFS Volume Plugin version=<version> revision=<source-sha>
 Published container images also expose `org.opencontainers.image.version`,
 `org.opencontainers.image.revision`, and `org.opencontainers.image.source` labels.
 The publishing workflow passes the GitHub source SHA as the revision for both
-architectures. Local `make` builds default to the current Git revision and the output
-of `git describe`; callers can override `VCS_REF` and `VERSION` explicitly.
+architectures. It first publishes the labeled image under the immutable
+`source-<full SHA>` tag, then creates both architecture-specific plugin packages from
+that exact image and annotates the final plugin manifest entries as `linux/amd64` and
+`linux/arm64`. Local `make` builds default to the current Git revision and the output of
+`git describe`; callers can override `VCS_REF` and `VERSION` explicitly.

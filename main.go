@@ -28,6 +28,9 @@ func init() {
 }
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == internalMountProbeArgument {
+		os.Exit(runInternalMountProbe(os.Args[2]))
+	}
 	log.Printf("Starting GlusterFS Volume Plugin version=%s revision=%s", version, revision)
 	defaultServers := splitList(os.Getenv("GFS_SERVERS"))
 	defaultVolume := strings.TrimSpace(os.Getenv("GFS_VOLUME"))
@@ -49,7 +52,9 @@ func main() {
 		recoveryIssues: map[string]error{},
 		defaultVolume:  defaultVolume,
 		defaultServers: defaultServers,
-		client:         glfsConnector{},
+		client:         &glfsConnector{},
+		mountInfo:      procMountInfoReader{path: mountInfoPath},
+		healthProbe:    subprocessMountHealthProbe{timeout: defaultMountProbeTimeout},
 	}
 	driver.reconcileStartup()
 
