@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -27,6 +26,7 @@ type glusterfsDriver struct {
 	store          *stateStore
 	volumes        map[string]volumeState
 	mounts         map[string]*activeMount
+	recoveryIssues map[string]error
 	defaultVolume  string
 	defaultServers []string
 	client         glfsConnector
@@ -99,6 +99,10 @@ func (d *glusterfsDriver) Get(r *volume.GetRequest) (*volume.GetResponse, error)
 	}
 	if mount, ok := d.mounts[r.Name]; ok {
 		status["mountpoint"] = mount.mountpoint
+		status["references"] = mount.connections
+	}
+	if issue, ok := d.recoveryIssues[r.Name]; ok {
+		status["recovery_issue"] = issue.Error()
 	}
 
 	vol := &volume.Volume{
@@ -115,24 +119,55 @@ func (d *glusterfsDriver) Remove(r *volume.RemoveRequest) error {
 	d.Lock()
 	defer d.Unlock()
 
+	if _, ok := d.volumes[r.Name]; !ok {
+		return nil
+	}
 	if mount, ok := d.mounts[r.Name]; ok && mount.connections > 0 {
 		return fmt.Errorf("volume %s is still mounted", r.Name)
+	}
+	target := d.mountpoint(r.Name)
+	mounted, err := d.reconcileTarget(r.Name, target)
+	if err != nil {
+		d.recoveryIssues[r.Name] = err
+		return err
+	}
+	if mounted {
+		if err := d.unmountPhysical(r.Name, target); err != nil {
+			d.recoveryIssues[r.Name] = err
+			return err
+		}
 	}
 
 	delete(d.volumes, r.Name)
 	delete(d.mounts, r.Name)
+	delete(d.recoveryIssues, r.Name)
 
 	return d.store.save(d.volumes)
 }
 
 func (d *glusterfsDriver) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
-	d.RLock()
-	defer d.RUnlock()
+	d.Lock()
+	defer d.Unlock()
 
 	mount, ok := d.mounts[r.Name]
 	if !ok || mount.connections == 0 {
 		return &volume.PathResponse{}, fmt.Errorf("no mountpoint for volume")
 	}
+	mounted, err := d.reconcileTarget(r.Name, mount.mountpoint)
+	if err != nil {
+		d.recoveryIssues[r.Name] = err
+		return &volume.PathResponse{}, err
+	}
+	if !mounted {
+		err := newRecoveryFailure(
+			r.Name, mount.mountpoint, "missing physical mount with active logical references",
+			"no false-success path was returned", fmt.Errorf("%d logical reference(s) remain", mount.connections),
+			"retry the mount request after resolving GlusterFS connectivity",
+		)
+		d.recoveryIssues[r.Name] = err
+		return &volume.PathResponse{}, err
+	}
+	delete(d.recoveryIssues, r.Name)
 
 	return &volume.PathResponse{Mountpoint: mount.mountpoint}, nil
 }
@@ -147,51 +182,27 @@ func (d *glusterfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, 
 	}
 
 	mountpoint := d.mountpoint(r.Name)
+	mounted, err := d.reconcileTarget(r.Name, mountpoint)
+	if err != nil {
+		d.recoveryIssues[r.Name] = err
+		return &volume.MountResponse{}, err
+	}
+	if !mounted {
+		if err := d.prepareMountpoint(r.Name, mountpoint); err != nil {
+			d.recoveryIssues[r.Name] = err
+			return &volume.MountResponse{}, err
+		}
+		if err := d.mountPhysical(r.Name, mountpoint, state); err != nil {
+			d.recoveryIssues[r.Name] = err
+			return &volume.MountResponse{}, err
+		}
+	}
+	delete(d.recoveryIssues, r.Name)
+
 	info, ok := d.mounts[r.Name]
 	if !ok {
 		info = &activeMount{mountpoint: mountpoint, ids: map[string]int{}, createdAt: time.Now().UTC()}
 		d.mounts[r.Name] = info
-	}
-
-	stat, err := os.Lstat(mountpoint)
-	if err != nil || info.connections == 0 {
-		if err != nil && !os.IsNotExist(err) {
-			_ = d.client.unmount(mountpoint)
-		}
-		if os.IsNotExist(err) {
-			if err := os.MkdirAll(mountpoint, defaultMode); err != nil && !os.IsExist(err) {
-				return &volume.MountResponse{}, err
-			}
-		}
-		stat, err = os.Lstat(mountpoint)
-		if err != nil {
-			return &volume.MountResponse{}, err
-		}
-		if !stat.IsDir() {
-			if err := os.Remove(mountpoint); err != nil {
-				return &volume.MountResponse{}, err
-			}
-			if err := os.MkdirAll(mountpoint, defaultMode); err != nil {
-				return &volume.MountResponse{}, err
-			}
-		}
-
-		if state.Subdir != "" {
-			if err := d.client.mountWithGlusterfs(mountpoint, state.Volume, state.Servers, ""); err != nil {
-				return &volume.MountResponse{}, err
-			}
-			if err := os.MkdirAll(filepath.Join(mountpoint, state.Subdir), defaultMode); err != nil {
-				_ = d.client.unmount(mountpoint)
-				return &volume.MountResponse{}, err
-			}
-			if err := d.client.unmount(mountpoint); err != nil {
-				return &volume.MountResponse{}, err
-			}
-		}
-
-		if err := d.client.mountWithGlusterfs(mountpoint, state.Volume, state.Servers, state.Subdir); err != nil {
-			return &volume.MountResponse{}, err
-		}
 	}
 
 	info.mountpoint = mountpoint
@@ -217,20 +228,23 @@ func (d *glusterfsDriver) Unmount(r *volume.UnmountRequest) error {
 		return fmt.Errorf("mount %s does not know about client %s", r.Name, r.ID)
 	}
 
+	if info.connections == 1 {
+		log.Printf("Unmounting volume %s", r.Name)
+		if err := d.unmountPhysical(r.Name, info.mountpoint); err != nil {
+			d.recoveryIssues[r.Name] = err
+			return err
+		}
+		delete(d.recoveryIssues, r.Name)
+		delete(d.mounts, r.Name)
+		return nil
+	}
+
 	count--
 	info.connections--
 	if count <= 0 {
 		delete(info.ids, r.ID)
 	} else {
 		info.ids[r.ID] = count
-	}
-
-	if len(info.ids) == 0 {
-		log.Printf("Unmounting volume %s", r.Name)
-		if err := d.client.unmount(info.mountpoint); err != nil {
-			return err
-		}
-		delete(d.mounts, r.Name)
 	}
 
 	return nil

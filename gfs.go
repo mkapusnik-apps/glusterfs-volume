@@ -55,3 +55,12 @@ func (d *glfsConnector) unmount(mountpoint string) error {
 	}
 	return nil
 }
+
+func (d *glfsConnector) unmountLazy(mountpoint string) error {
+	cmd := exec.Command("umount", "--lazy", mountpoint)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("lazy umount failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}

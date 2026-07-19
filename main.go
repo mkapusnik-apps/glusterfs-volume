@@ -12,6 +12,9 @@ const socketAddress = "glusterfs"
 const propagatedMount = "/var/lib/glusterfs-volume"
 const stateFile = "/var/lib/glusterfs-volume/.glusterfs-plugin/volumes.json"
 
+var version = "dev"
+var revision = "unknown"
+
 func init() {
 	log.SetFlags(0)
 	logfile := os.Getenv("LOGFILE")
@@ -25,6 +28,7 @@ func init() {
 }
 
 func main() {
+	log.Printf("Starting GlusterFS Volume Plugin version=%s revision=%s", version, revision)
 	defaultServers := splitList(os.Getenv("GFS_SERVERS"))
 	defaultVolume := strings.TrimSpace(os.Getenv("GFS_VOLUME"))
 	if err := ensureDirPath(propagatedMount, 0o755); err != nil {
@@ -42,10 +46,12 @@ func main() {
 		store:          store,
 		volumes:        volumes,
 		mounts:         map[string]*activeMount{},
+		recoveryIssues: map[string]error{},
 		defaultVolume:  defaultVolume,
 		defaultServers: defaultServers,
 		client:         glfsConnector{},
 	}
+	driver.reconcileStartup()
 
 	h := volume.NewHandler(driver)
 	log.Printf("GlusterFS Volume Plugin listening on %s.sock", socketAddress)

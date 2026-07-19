@@ -44,6 +44,11 @@ func parseGfsName(raw string) (string, string, error) {
 	if len(parts) == 0 || parts[0] == "" {
 		return "", "", errors.New("invalid glusterfs name")
 	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return "", "", errors.New("invalid glusterfs path component")
+		}
+	}
 	volume := parts[0]
 	if len(parts) == 1 {
 		return volume, "", nil
@@ -57,9 +62,7 @@ func ensureDirPath(path string, mode os.FileMode) error {
 		if info.IsDir() {
 			return nil
 		}
-		if err := os.Remove(path); err != nil {
-			return err
-		}
+		return errors.New("path exists and is not a directory")
 	} else if !os.IsNotExist(err) {
 		return err
 	}
