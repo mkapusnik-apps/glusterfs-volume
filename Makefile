@@ -6,7 +6,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || printf de
 VCS_REF ?= $(shell git rev-parse --verify HEAD 2>/dev/null || printf unknown)
 
 PLUGIN_NAME := $(REGISTRY)$(PLUGIN)
-GO_SOURCES := $(shell ls *.go)
+GO_SOURCES := $(shell find . -type f -name '*.go' -print)
 
 .PHONY: all build image plugin clean push
 

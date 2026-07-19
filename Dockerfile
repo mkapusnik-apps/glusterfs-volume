@@ -13,7 +13,7 @@ COPY . .
 RUN set -eu; \
     test -n "${VCS_REF}"; \
     test "${VCS_REF}" != "unknown"; \
-    unformatted="$(gofmt -l *.go)"; \
+    unformatted="$(gofmt -l $(find . -type f -name '*.go' -print))"; \
     if [ -n "${unformatted}" ]; then \
       printf 'Unformatted Go files:\n%s\n' "${unformatted}" >&2; \
       gofmt -d ${unformatted} >&2; \

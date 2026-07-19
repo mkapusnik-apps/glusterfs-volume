@@ -1,4 +1,4 @@
-package main
+package plugin
 
 import (
 	"bufio"
@@ -310,11 +310,15 @@ func isStaleMountError(err error) bool {
 }
 
 func (d *glusterfsDriver) reconcileStartup() {
+	ctx, cancel := context.WithTimeout(context.Background(), startupRecoveryTimeout)
+	defer cancel()
+	d.reconcileStartupContext(ctx)
+}
+
+func (d *glusterfsDriver) reconcileStartupContext(ctx context.Context) {
 	d.Lock()
 	defer d.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), startupRecoveryTimeout)
-	defer cancel()
 	for name, state := range d.volumes {
 		target, err := d.validatedTarget(name, state)
 		if err != nil {
