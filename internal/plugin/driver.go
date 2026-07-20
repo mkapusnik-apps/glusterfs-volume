@@ -32,6 +32,7 @@ type glusterfsDriver struct {
 	client         glusterConnector
 	mountInfo      mountInfoReader
 	healthProbe    mountHealthProbe
+	subdirectories subdirectoryPreparer
 }
 
 func (d *glusterfsDriver) Create(r *volume.CreateRequest) error {

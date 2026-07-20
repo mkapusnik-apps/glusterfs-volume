@@ -31,6 +31,7 @@ func Main(version, revision string) {
 		log.Fatalf("failed to load state: %v", err)
 	}
 
+	mountInfo := procMountInfoReader{path: mountInfoPath}
 	driver := &glusterfsDriver{
 		root:           propagatedMount,
 		store:          store,
@@ -40,8 +41,9 @@ func Main(version, revision string) {
 		defaultVolume:  defaultVolume,
 		defaultServers: defaultServers,
 		client:         &glfsConnector{},
-		mountInfo:      procMountInfoReader{path: mountInfoPath},
+		mountInfo:      mountInfo,
 		healthProbe:    subprocessMountHealthProbe{timeout: defaultMountProbeTimeout},
+		subdirectories: descriptorSubdirectoryPreparer{mountInfo: mountInfo, operations: linuxDirectoryOperations{}},
 	}
 	driver.reconcileStartup()
 

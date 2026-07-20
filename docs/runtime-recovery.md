@@ -25,11 +25,13 @@ physical mount is treated as a failure. Residual managed state from a failed att
 detached when it is safe to identify; logical state is not recorded for the failed
 request, so the request remains retryable.
 
-When a mount command creates one identifiable mount but post-mount identity or health
-verification fails, the plugin revalidates the full mountinfo record and lazily rolls
-that command-created mount back. If concurrent or duplicate records make ownership
-ambiguous, it preserves the stack and reports the required manual action instead of
-blindly unmounting another user's filesystem.
+When a mount command leaves one identifiable mount but post-mount health verification
+fails, rollback requires pre/post evidence that the mount ID was absent before the
+attempt, the complete configured identity matches, and the record remains unchanged
+immediately before detach. An unreadable post-command mount table, mismatched identity,
+pre-existing mount ID, concurrent replacement, or duplicate record is preserved with an
+actionable unavailable outcome. The plugin never uses a failed identity read as a reason
+to unmount a sole record.
 
 Mount identity includes the mount ID and parent, device, root, target, mount and super
 options, filesystem type, and source retained from mountinfo. Reuse additionally
@@ -49,6 +51,14 @@ The same behavior applies to whole-volume and subdirectory-backed definitions. F
 subdirectory definition, the plugin temporarily mounts the volume root to ensure the
 remote subdirectory exists, unmounts it, and then creates and verifies the requested
 subdirectory mount.
+
+Remote subdirectory traversal and creation are bound to an open descriptor for the
+verified temporary mount. The plugin checks the complete mount identity before opening,
+checks the descriptor device against mountinfo, revalidates identity before mutation,
+and uses descriptor-relative `openat` and `mkdirat` operations with symlink following
+disabled. Every traversed component must remain a directory on the verified device. If
+the temporary mount disappears or is replaced, no path-based mutation is attempted, so
+the underlying ordinary mountpoint directory and unknown replacement remain unchanged.
 
 ## Mountpoint directories and local data
 

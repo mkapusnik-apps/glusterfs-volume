@@ -60,6 +60,16 @@ type mountRecord struct {
 	superOptions   string
 }
 
+type mountAttemptEvidence struct {
+	preMountIDs map[int]struct{}
+	state       volumeState
+	subdir      string
+}
+
+type attemptMount struct {
+	record mountRecord
+}
+
 type recoveryFailure struct {
 	volume     string
 	target     string
@@ -206,6 +216,21 @@ func (r mountRecord) sameIdentity(other mountRecord) bool {
 		r.filesystem == other.filesystem &&
 		r.source == other.source &&
 		r.superOptions == other.superOptions
+}
+
+func newMountAttemptEvidence(records []mountRecord, state volumeState, subdir string) mountAttemptEvidence {
+	ids := make(map[int]struct{}, len(records))
+	for _, record := range records {
+		ids[record.mountID] = struct{}{}
+	}
+	return mountAttemptEvidence{preMountIDs: ids, state: state, subdir: subdir}
+}
+
+func (e mountAttemptEvidence) attributes(record mountRecord) bool {
+	if _, existed := e.preMountIDs[record.mountID]; existed {
+		return false
+	}
+	return recordMatchesExpected(record, e.state, e.subdir)
 }
 
 func expectedMountSources(state volumeState, subdir string) []string {
@@ -518,72 +543,72 @@ func (d *glusterfsDriver) prepareMountpoint(volumeName, target string, state vol
 
 func (d *glusterfsDriver) mountPhysical(ctx context.Context, volumeName, target string, state volumeState) error {
 	if state.Subdir != "" {
-		if err := d.mountAndVerify(ctx, volumeName, target, state, "", "preparing the GlusterFS subdirectory"); err != nil {
+		temporary, err := d.mountAndVerify(ctx, volumeName, target, state, "", "preparing the GlusterFS subdirectory")
+		if err != nil {
 			return err
 		}
-		subdirTarget := filepath.Join(target, state.Subdir)
-		if err := os.MkdirAll(subdirTarget, defaultMode); err != nil {
-			return d.rollbackExpectedMount(ctx, volumeName, target, state, "", "failed to prepare the GlusterFS subdirectory", err)
+		if d.subdirectories == nil {
+			return d.rollbackAttemptMount(ctx, volumeName, target, *temporary, "failed to prepare the GlusterFS subdirectory", errors.New("descriptor-relative subdirectory preparation is not configured"))
+		}
+		if err := d.subdirectories.prepare(ctx, target, state.Subdir, temporary.record); err != nil {
+			return d.rollbackAttemptMount(ctx, volumeName, target, *temporary, "failed to prepare the GlusterFS subdirectory", err)
 		}
 		if err := d.unmountPhysical(ctx, volumeName, target, state, ""); err != nil {
 			return err
 		}
 	}
-	return d.mountAndVerify(ctx, volumeName, target, state, state.Subdir, "mounting the requested GlusterFS path")
+	_, err := d.mountAndVerify(ctx, volumeName, target, state, state.Subdir, "mounting the requested GlusterFS path")
+	return err
 }
 
-func (d *glusterfsDriver) mountAndVerify(ctx context.Context, volumeName, target string, state volumeState, subdir, operation string) error {
+func (d *glusterfsDriver) mountAndVerify(ctx context.Context, volumeName, target string, state volumeState, subdir, operation string) (*attemptMount, error) {
 	records, err := d.mountInfo.read(ctx)
 	if err != nil {
-		return newRecoveryFailure(volumeName, target, operation, "did not start the mount command", err, "restore mountinfo access, then retry")
+		return nil, newRecoveryFailure(volumeName, target, operation, "did not start the mount command", err, "restore mountinfo access, then retry")
 	}
 	exact, descendants := recordsForTarget(records, target)
 	if len(exact) != 0 || len(descendants) != 0 {
-		return newRecoveryFailure(volumeName, target, operation, "did not start the mount command and preserved existing state", fmt.Errorf("found %d exact and %d nested mount(s)", len(exact), len(descendants)), "resolve conflicting mounts, then retry")
+		return nil, newRecoveryFailure(volumeName, target, operation, "did not start the mount command and preserved existing state", fmt.Errorf("found %d exact and %d nested mount(s)", len(exact), len(descendants)), "resolve conflicting mounts, then retry")
 	}
+	evidence := newMountAttemptEvidence(records, state, subdir)
 	if err := d.client.mountWithGlusterfs(ctx, target, state.Volume, state.Servers, subdir); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), rollbackOperationTimeout)
 		defer cancel()
-		return d.cleanupAfterMountCommand(cleanupCtx, volumeName, target, operation, err)
+		return nil, d.cleanupAfterMountCommand(cleanupCtx, volumeName, target, operation, evidence, err)
 	}
 	records, err = d.mountInfo.read(ctx)
 	if err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), rollbackOperationTimeout)
-		defer cancel()
-		rollbackErr := d.client.unmountLazy(cleanupCtx, target)
-		result := "mount command succeeded; rollback was attempted because mountinfo verification failed"
-		cause := fmt.Errorf("verify mount identity: %w", err)
-		if rollbackErr != nil {
-			result = "mount command succeeded but rollback also failed"
-			cause = fmt.Errorf("%w; rollback cause: %v", cause, rollbackErr)
-		}
-		return newRecoveryFailure(volumeName, target, operation, result, cause, "inspect the target and clear any residual intended mount before retrying")
+		return nil, newRecoveryFailure(volumeName, target, operation, "preserved unverifiable post-command mount state and added no logical reference", fmt.Errorf("verify mount identity: %w", err), "restore mountinfo access, inspect the target, and retry only after resolving any residual mount")
 	}
 	exact, descendants = recordsForTarget(records, target)
 	if len(descendants) != 0 || len(exact) > 1 {
-		return newRecoveryFailure(
+		return nil, newRecoveryFailure(
 			volumeName, target, operation, "preserved an ambiguous post-mount stack rather than disrupting unknown users",
 			fmt.Errorf("verification found %d exact and %d nested mount(s)", len(exact), len(descendants)),
 			"inspect the target mount stack, remove conflicts manually, then retry",
 		)
 	}
 	if len(exact) == 0 {
-		return newRecoveryFailure(volumeName, target, operation, "no physical mount was recorded and no logical reference was added", errors.New("mount command reported success without a mountinfo entry"), "inspect GlusterFS client logs and connectivity, then retry")
+		return nil, newRecoveryFailure(volumeName, target, operation, "no physical mount was recorded and no logical reference was added", errors.New("mount command reported success without a mountinfo entry"), "inspect GlusterFS client logs and connectivity, then retry")
 	}
 	record := exact[0]
 	if !recordMatchesExpected(record, state, subdir) {
-		return d.rollbackRecord(ctx, volumeName, target, record, operation, fmt.Errorf("mounted identity source %q does not match expected sources %q", record.source, expectedMountSources(state, subdir)))
+		return nil, newRecoveryFailure(volumeName, target, operation, "preserved mismatched post-command mount state and added no logical reference", fmt.Errorf("mounted identity source %q does not match expected sources %q", record.source, expectedMountSources(state, subdir)), "inspect and resolve the unknown mount manually, then retry")
 	}
+	if !evidence.attributes(record) {
+		return nil, newRecoveryFailure(volumeName, target, operation, "preserved a mount whose ownership was not attributable to this attempt", fmt.Errorf("mount ID %d was already present before the command", record.mountID), "inspect the target mount identity manually, then retry")
+	}
+	attempt := &attemptMount{record: record}
 	if err := d.healthProbe.probe(ctx, target); err != nil {
-		return d.rollbackRecord(ctx, volumeName, target, record, operation, fmt.Errorf("post-mount health verification failed: %w", err))
+		return nil, d.rollbackAttemptMount(ctx, volumeName, target, *attempt, operation, fmt.Errorf("post-mount health verification failed: %w", err))
 	}
-	return nil
+	return attempt, nil
 }
 
-func (d *glusterfsDriver) cleanupAfterMountCommand(ctx context.Context, volumeName, target, operation string, mountErr error) error {
+func (d *glusterfsDriver) cleanupAfterMountCommand(ctx context.Context, volumeName, target, operation string, evidence mountAttemptEvidence, mountErr error) error {
 	records, inspectErr := d.mountInfo.read(ctx)
 	if inspectErr != nil {
-		return newRecoveryFailure(volumeName, target, operation, "mount command failed and residual state could not be inspected", fmt.Errorf("%w; mountinfo cause: %v", mountErr, inspectErr), "inspect and clear any residual mount manually before retrying")
+		return newRecoveryFailure(volumeName, target, operation, "mount command failed; preserved unverifiable residual state", fmt.Errorf("%w; mountinfo cause: %v", mountErr, inspectErr), "restore mountinfo access and inspect any residual mount manually before retrying")
 	}
 	exact, descendants := recordsForTarget(records, target)
 	if len(descendants) != 0 || len(exact) > 1 {
@@ -592,29 +617,21 @@ func (d *glusterfsDriver) cleanupAfterMountCommand(ctx context.Context, volumeNa
 	if len(exact) == 0 {
 		return newRecoveryFailure(volumeName, target, operation, "no residual physical mount remains; state is retryable", mountErr, "resolve the GlusterFS cause and retry")
 	}
-	return d.rollbackRecord(ctx, volumeName, target, exact[0], operation, mountErr)
+	record := exact[0]
+	if !evidence.attributes(record) {
+		return newRecoveryFailure(volumeName, target, operation, "mount command failed; preserved residual state not attributable to this attempt", mountErr, "inspect and resolve the residual mount manually, then retry")
+	}
+	return d.rollbackAttemptMount(ctx, volumeName, target, attemptMount{record: record}, operation, mountErr)
 }
 
-func (d *glusterfsDriver) rollbackExpectedMount(ctx context.Context, volumeName, target string, state volumeState, subdir, operation string, cause error) error {
-	records, err := d.mountInfo.read(ctx)
-	if err != nil {
-		return newRecoveryFailure(volumeName, target, operation, "could not inspect the owned mount for rollback", fmt.Errorf("%w; mountinfo cause: %v", cause, err), "inspect and clear the target manually before retrying")
-	}
-	exact, descendants := recordsForTarget(records, target)
-	if len(exact) != 1 || len(descendants) != 0 || !recordMatchesExpected(exact[0], state, subdir) {
-		return newRecoveryFailure(volumeName, target, operation, "preserved changed or ambiguous state during rollback", cause, "inspect the target mount stack manually, then retry")
-	}
-	return d.rollbackRecord(ctx, volumeName, target, exact[0], operation, cause)
-}
-
-func (d *glusterfsDriver) rollbackRecord(ctx context.Context, volumeName, target string, record mountRecord, operation string, cause error) error {
+func (d *glusterfsDriver) rollbackAttemptMount(ctx context.Context, volumeName, target string, attempt attemptMount, operation string, cause error) error {
 	cleanupCtx := ctx
 	cancel := func() {}
 	if ctx.Err() != nil {
 		cleanupCtx, cancel = context.WithTimeout(context.Background(), rollbackOperationTimeout)
 	}
 	defer cancel()
-	if err := d.detachExactMount(cleanupCtx, volumeName, target, record, operation); err != nil {
+	if err := d.detachExactMount(cleanupCtx, volumeName, target, attempt.record, operation); err != nil {
 		return newRecoveryFailure(volumeName, target, operation, "owned partial mount rollback failed", fmt.Errorf("%w; rollback cause: %v", cause, err), "clear the target mount state manually, then retry")
 	}
 	return newRecoveryFailure(volumeName, target, operation, "detached the single command-created mount; state is retryable", cause, "resolve the GlusterFS cause and retry")
