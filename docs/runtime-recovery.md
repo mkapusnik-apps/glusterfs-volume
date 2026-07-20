@@ -92,6 +92,14 @@ references are process-local; after a plugin restart they begin empty and Docker
 subsequent successful mount calls recreate them, while startup reconciliation handles
 the surviving physical state.
 
+Every regular physical unmount retains the complete mountinfo record accepted before
+the health probe, then reads mountinfo again immediately before invoking unmount. The
+record must remain the sole exact mount, have no nested mounts, and match the accepted
+identity completely. Missing, duplicated, replaced, changed, or unreadable state fails
+closed without regular or lazy unmount. This applies to the final logical-reference
+release, volume removal, and temporary whole-volume cleanup during subdirectory setup;
+caller state and unknown replacement mounts remain available for inspection and retry.
+
 ## Unknown mounts
 
 The ownership boundary is an exact, validated target derived from a persisted volume

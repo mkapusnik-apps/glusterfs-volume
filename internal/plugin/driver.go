@@ -147,16 +147,9 @@ func (d *glusterfsDriver) Remove(r *volume.RemoveRequest) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), requestOperationTimeout)
 	defer cancel()
-	mounted, err := d.reconcileTarget(ctx, r.Name, target, state)
-	if err != nil {
+	if err := d.unmountPhysical(ctx, r.Name, target, state, state.Subdir); err != nil {
 		d.recoveryIssues[r.Name] = err
 		return err
-	}
-	if mounted {
-		if err := d.unmountPhysical(ctx, r.Name, target, state, state.Subdir); err != nil {
-			d.recoveryIssues[r.Name] = err
-			return err
-		}
 	}
 
 	delete(d.volumes, r.Name)
