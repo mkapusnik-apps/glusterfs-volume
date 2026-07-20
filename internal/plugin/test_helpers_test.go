@@ -6,9 +6,32 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
+
+func TestMain(m *testing.M) {
+	if len(os.Args) == 3 && os.Args[1] == internalMountProbeArgument {
+		if delay := os.Getenv("PLUGIN_TEST_PROBE_SLEEP"); delay != "" {
+			duration, err := time.ParseDuration(delay)
+			if err != nil {
+				os.Exit(probeExitOther)
+			}
+			time.Sleep(duration)
+		}
+		if code := os.Getenv("PLUGIN_TEST_PROBE_EXIT"); code != "" {
+			value, err := strconv.Atoi(code)
+			if err != nil {
+				os.Exit(probeExitOther)
+			}
+			os.Exit(value)
+		}
+		os.Exit(runInternalMountProbe(os.Args[2]))
+	}
+	os.Exit(m.Run())
+}
 
 type fakeMountInfo struct {
 	mu      sync.Mutex
@@ -121,6 +144,79 @@ type fakeProbe struct {
 	err   error
 	errs  map[string]error
 	calls []string
+}
+
+type subdirectoryCall struct {
+	target   string
+	subdir   string
+	expected mountRecord
+}
+
+type fakeSubdirectoryPreparer struct {
+	mu    sync.Mutex
+	calls []subdirectoryCall
+	err   error
+}
+
+func (f *fakeSubdirectoryPreparer) prepare(_ context.Context, target, subdir string, expected mountRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, subdirectoryCall{target: target, subdir: subdir, expected: expected})
+	return f.err
+}
+
+func (f *fakeSubdirectoryPreparer) snapshot() []subdirectoryCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]subdirectoryCall(nil), f.calls...)
+}
+
+type mountInfoResult struct {
+	records []mountRecord
+	err     error
+}
+
+type scriptedMountInfo struct {
+	mu      sync.Mutex
+	results []mountInfoResult
+	reads   int
+}
+
+type cancelAfterFirstMountInfo struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	reads  int
+}
+
+func (r *cancelAfterFirstMountInfo) read(ctx context.Context) ([]mountRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reads++
+	if r.reads == 1 {
+		r.cancel()
+	}
+	return nil, nil
+}
+
+func (s *scriptedMountInfo) read(ctx context.Context) ([]mountRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	index := s.reads
+	s.reads++
+	if len(s.results) == 0 {
+		return nil, nil
+	}
+	if index >= len(s.results) {
+		index = len(s.results) - 1
+	}
+	result := s.results[index]
+	return append([]mountRecord(nil), result.records...), result.err
 }
 
 func (f *fakeProbe) probe(ctx context.Context, target string) error {

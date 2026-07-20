@@ -3,7 +3,6 @@ package plugin
 import (
 	"context"
 	"errors"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -75,6 +74,8 @@ func TestSubdirectoryMountUsesTemporaryRootThenVerifiedSubdirectory(t *testing.T
 	state := testState("volume-a", "configs/speed")
 	driver, table, client, _ := newTestDriver(t, map[string]volumeState{"volume-a": state})
 	installSuccessfulMountBehavior(table, client, state)
+	preparer := &fakeSubdirectoryPreparer{}
+	driver.subdirectories = preparer
 	target := filepath.Join(driver.root, "volume-a")
 
 	response, err := driver.Mount(&volume.MountRequest{Name: "volume-a", ID: "client-a"})
@@ -95,13 +96,17 @@ func TestSubdirectoryMountUsesTemporaryRootThenVerifiedSubdirectory(t *testing.T
 	if len(records) != 1 || !recordMatchesExpected(records[0], state, state.Subdir) {
 		t.Fatalf("final mount identity = %#v", records)
 	}
-	if info, statErr := os.Stat(filepath.Join(target, state.Subdir)); statErr != nil || !info.IsDir() {
-		t.Fatalf("remote subdirectory preparation simulation info=%v err=%v", info, statErr)
+	preparations := preparer.snapshot()
+	if len(preparations) != 1 {
+		t.Fatalf("subdirectory preparations = %#v", preparations)
+	}
+	if preparations[0].target != target || preparations[0].subdir != state.Subdir || !recordMatchesExpected(preparations[0].expected, state, "") {
+		t.Fatalf("unsafe or incorrect subdirectory preparation = %#v", preparations[0])
 	}
 	assertActiveReferences(t, driver.mounts["volume-a"], 1, map[string]int{"client-a": 1})
 }
 
-func TestPostMountIdentityMismatchRollsBackWithoutPhantomAndRetrySucceeds(t *testing.T) {
+func TestPostMountIdentityMismatchIsPreservedWithoutPhantomAndRetriesOnlyAfterResolution(t *testing.T) {
 	state := testState("volume-a", "")
 	driver, table, client, _ := newTestDriver(t, map[string]volumeState{"volume-a": state})
 	call := 0
@@ -114,27 +119,31 @@ func TestPostMountIdentityMismatchRollsBackWithoutPhantomAndRetrySucceeds(t *tes
 		table.set(record)
 		return nil
 	}
-	client.lazyFn = func(_ context.Context, _ string) error {
-		table.set()
-		return nil
-	}
 
-	if _, err := driver.Mount(&volume.MountRequest{Name: "volume-a", ID: "client-a"}); err == nil || !strings.Contains(err.Error(), "detached the single command-created mount; state is retryable") {
+	if _, err := driver.Mount(&volume.MountRequest{Name: "volume-a", ID: "client-a"}); err == nil || !strings.Contains(err.Error(), "preserved mismatched post-command mount state and added no logical reference") || !strings.Contains(err.Error(), "inspect and resolve the unknown mount manually") {
 		t.Fatalf("identity mismatch error = %v", err)
 	}
 	if _, ok := driver.mounts["volume-a"]; ok {
 		t.Fatalf("failed mount left phantom references: %#v", driver.mounts["volume-a"])
 	}
-	if len(table.snapshot()) != 0 {
-		t.Fatalf("failed mount left residual record: %#v", table.snapshot())
+	if len(table.snapshot()) != 1 || table.snapshot()[0].source != "server-a:wrong-volume" {
+		t.Fatalf("mismatched unknown mount was not preserved: %#v", table.snapshot())
 	}
 	_, _, lazy := client.counts()
-	if lazy != 1 {
-		t.Fatalf("rollback lazy unmounts = %d", lazy)
+	if lazy != 0 {
+		t.Fatalf("mismatched unknown mount was lazily unmounted %d time(s)", lazy)
 	}
 
+	if _, err := driver.Mount(&volume.MountRequest{Name: "volume-a", ID: "client-a"}); err == nil || !strings.Contains(err.Error(), "conflicting or temporary mount identity") {
+		t.Fatalf("retry before conflict resolution error = %v", err)
+	}
+	if mounts, _, _ := client.counts(); mounts != 1 {
+		t.Fatalf("retry before resolution issued another mount command; calls=%d", mounts)
+	}
+
+	table.set() // Simulate explicit operator conflict resolution.
 	if _, err := driver.Mount(&volume.MountRequest{Name: "volume-a", ID: "client-a"}); err != nil {
-		t.Fatalf("retry failed: %v", err)
+		t.Fatalf("retry after conflict resolution failed: %v", err)
 	}
 	assertActiveReferences(t, driver.mounts["volume-a"], 1, map[string]int{"client-a": 1})
 	if driver.recoveryIssues["volume-a"] != nil {
@@ -186,32 +195,56 @@ func TestPostMountUnhealthyProbeRollsBackOwnedMount(t *testing.T) {
 	}
 }
 
-func TestPostMountVerificationFailureAttemptsRollbackAndAddsNoReference(t *testing.T) {
+func TestPostMountVerificationFailurePreservesUnverifiableStateAndAddsNoReference(t *testing.T) {
 	state := testState("volume-a", "")
 	driver, table, client, _ := newTestDriver(t, map[string]volumeState{"volume-a": state})
 	table.errors = map[int]error{3: errors.New("mountinfo temporarily unavailable")}
 	client.mountFn = func(_ context.Context, target, _ string, _ []string, subdir string) error {
-		table.set(intendedRecord(target, state, subdir, 40))
-		return nil
-	}
-	client.lazyFn = func(_ context.Context, _ string) error {
-		table.set()
+		record := intendedRecord(target, state, subdir, 40)
+		record.source = "unknown-server:unverifiable-volume"
+		table.set(record)
 		return nil
 	}
 
 	_, err := driver.Mount(&volume.MountRequest{Name: "volume-a", ID: "client-a"})
-	if err == nil || !strings.Contains(err.Error(), "rollback was attempted because mountinfo verification failed") {
+	if err == nil || !strings.Contains(err.Error(), "preserved unverifiable post-command mount state and added no logical reference") || !strings.Contains(err.Error(), "inspect the target") {
 		t.Fatalf("verification failure error = %v", err)
 	}
 	if _, ok := driver.mounts["volume-a"]; ok {
 		t.Fatal("unverified mount added a logical reference")
 	}
-	if len(table.snapshot()) != 0 {
-		t.Fatalf("rollback left record: %#v", table.snapshot())
+	if len(table.snapshot()) != 1 || table.snapshot()[0].source != "unknown-server:unverifiable-volume" {
+		t.Fatalf("unverifiable post-command record was not preserved: %#v", table.snapshot())
 	}
 	_, _, lazy := client.counts()
-	if lazy != 1 {
-		t.Fatalf("rollback attempts = %d, want 1", lazy)
+	if lazy != 0 {
+		t.Fatalf("unverifiable record was lazily unmounted %d time(s)", lazy)
+	}
+}
+
+func TestMountCommandFailurePreservesSoleUnexpectedPostSnapshotRecord(t *testing.T) {
+	state := testState("volume-a", "")
+	driver, table, client, _ := newTestDriver(t, map[string]volumeState{"volume-a": state})
+	client.mountFn = func(_ context.Context, target, _ string, _ []string, _ string) error {
+		record := intendedRecord(target, state, "", 45)
+		record.source = "unknown-server:unknown-volume"
+		table.set(record)
+		return errors.New("mount command failed while unknown mount appeared")
+	}
+
+	_, err := driver.Mount(&volume.MountRequest{Name: "volume-a", ID: "client-a"})
+	if err == nil || !strings.Contains(err.Error(), "preserved residual state not attributable to this attempt") || !strings.Contains(err.Error(), "inspect and resolve the residual mount manually") {
+		t.Fatalf("unexpected residual error = %v", err)
+	}
+	if _, ok := driver.mounts["volume-a"]; ok {
+		t.Fatal("unexpected residual mount added a logical reference")
+	}
+	if records := table.snapshot(); len(records) != 1 || records[0].source != "unknown-server:unknown-volume" {
+		t.Fatalf("unexpected record was not preserved: %#v", records)
+	}
+	_, unmounts, lazy := client.counts()
+	if unmounts != 0 || lazy != 0 {
+		t.Fatalf("unexpected record was detached: unmount=%d lazy=%d", unmounts, lazy)
 	}
 }
 

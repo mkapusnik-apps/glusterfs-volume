@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -108,6 +109,103 @@ func TestReconcileTargetRequiresExactConfiguredMountIdentity(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStaleCandidateIdentityChangeBeforeDetachPreservesReplacement(t *testing.T) {
+	state := testState("volume-a", "")
+	driver, _, client, probe := newTestDriver(t, map[string]volumeState{"volume-a": state})
+	target := filepath.Join(driver.root, "volume-a")
+	candidate := intendedRecord(target, state, "", 17)
+	replacement := intendedRecord(target, state, "", 18)
+	replacement.source = "server-b:replacement-volume"
+	driver.mountInfo = &scriptedMountInfo{results: []mountInfoResult{
+		{records: []mountRecord{candidate}},
+		{records: []mountRecord{replacement}},
+	}}
+	probe.err = syscall.ENOTCONN
+
+	mounted, err := driver.reconcileTarget(context.Background(), "volume-a", target, state)
+	if mounted || err == nil || !strings.Contains(err.Error(), "preserved changed or ambiguous mount state") {
+		t.Fatalf("changed identity result mounted=%v error=%v", mounted, err)
+	}
+	if mounts, unmounts, lazy := client.counts(); mounts+unmounts+lazy != 0 {
+		t.Fatalf("replacement mount was modified: mount=%d unmount=%d lazy=%d", mounts, unmounts, lazy)
+	}
+}
+
+func TestProcMountInfoReaderParsesIndependentGlusterRootAndSubdirectoryFixtures(t *testing.T) {
+	fixture := strings.Join([]string{
+		`101 55 0:42 / /var/lib/glusterfs-volume/root\040volume rw,nosuid,nodev,relatime shared:12 - fuse.glusterfs server-a:gv0 rw,user_id=0,group_id=0`,
+		`102 55 0:43 / /var/lib/glusterfs-volume/subdir\040volume rw,nosuid,nodev,relatime master:1 - fuse.glusterfs server-b:gv0/configs/speed rw,user_id=0,group_id=0`,
+	}, "\n") + "\n"
+	path := filepath.Join(t.TempDir(), "mountinfo")
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := (procMountInfoReader{path: path}).read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("records = %#v", records)
+	}
+	root := records[0]
+	if root.mountID != 101 || root.parentID != 55 || root.majorMinor != "0:42" || root.root != "/" || root.target != "/var/lib/glusterfs-volume/root volume" || root.filesystem != "fuse.glusterfs" || root.source != "server-a:gv0" || root.optionalFields != "shared:12" {
+		t.Fatalf("parsed direct-root fixture = %#v", root)
+	}
+	subdir := records[1]
+	if subdir.mountID != 102 || subdir.majorMinor != "0:43" || subdir.target != "/var/lib/glusterfs-volume/subdir volume" || subdir.source != "server-b:gv0/configs/speed" || subdir.optionalFields != "master:1" {
+		t.Fatalf("parsed subdirectory fixture = %#v", subdir)
+	}
+	rootState := volumeState{Name: "root volume", Servers: []string{"server-a"}, Volume: "gv0"}
+	if !recordMatchesExpected(root, rootState, "") {
+		t.Fatal("literal direct-root fixture did not match its independently asserted identity")
+	}
+	subdirState := volumeState{Name: "subdir volume", Servers: []string{"server-b"}, Volume: "gv0", Subdir: "configs/speed"}
+	if !recordMatchesExpected(subdir, subdirState, "configs/speed") {
+		t.Fatal("literal subdirectory fixture did not match its independently asserted identity")
+	}
+}
+
+func TestSubprocessMountHealthProbeExitMappingAndTimeout(t *testing.T) {
+	tests := []struct {
+		name      string
+		exitCode  int
+		wantError error
+		wantText  string
+	}{
+		{name: "healthy", exitCode: probeExitHealthy},
+		{name: "not connected", exitCode: probeExitNotConnected, wantError: syscall.ENOTCONN},
+		{name: "stale", exitCode: probeExitStale, wantError: syscall.ESTALE},
+		{name: "IO", exitCode: probeExitIO, wantError: syscall.EIO},
+		{name: "other", exitCode: probeExitOther, wantText: "exited with status 4"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("PLUGIN_TEST_PROBE_SLEEP", "")
+			t.Setenv("PLUGIN_TEST_PROBE_EXIT", strconv.Itoa(test.exitCode))
+			err := (subprocessMountHealthProbe{timeout: time.Second}).probe(context.Background(), "/unused-test-target")
+			if test.wantError == nil && test.wantText == "" && err != nil {
+				t.Fatal(err)
+			}
+			if test.wantError != nil && !errors.Is(err, test.wantError) {
+				t.Fatalf("error = %v, want %v", err, test.wantError)
+			}
+			if test.wantText != "" && (err == nil || !strings.Contains(err.Error(), test.wantText)) {
+				t.Fatalf("error = %v, want substring %q", err, test.wantText)
+			}
+		})
+	}
+
+	t.Run("timeout", func(t *testing.T) {
+		t.Setenv("PLUGIN_TEST_PROBE_EXIT", strconv.Itoa(probeExitHealthy))
+		t.Setenv("PLUGIN_TEST_PROBE_SLEEP", "200ms")
+		err := (subprocessMountHealthProbe{timeout: 10 * time.Millisecond}).probe(context.Background(), "/unused-test-target")
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "mount health probe exceeded") {
+			t.Fatalf("timeout error = %v", err)
+		}
+	})
 }
 
 func TestStartupReconciliationOutcomes(t *testing.T) {
@@ -239,6 +337,38 @@ func TestStartupReconciliationOutcomes(t *testing.T) {
 			t.Fatal("unknown mount invoked connector")
 		}
 	})
+}
+
+func TestStartupOverallDeadlinePartwayThroughVolumesStopsLaterOperations(t *testing.T) {
+	states := map[string]volumeState{
+		"volume-a": testState("volume-a", ""),
+		"volume-b": testState("volume-b", ""),
+	}
+	driver, _, client, probe := newTestDriver(t, states)
+	ctx, cancel := context.WithCancel(context.Background())
+	driver.mountInfo = &cancelAfterFirstMountInfo{cancel: cancel}
+
+	driver.reconcileStartupContext(ctx)
+
+	prepared := 0
+	timedOut := 0
+	for name := range states {
+		if info, err := os.Stat(filepath.Join(driver.root, name)); err == nil && info.IsDir() {
+			prepared++
+		}
+		if issue := driver.recoveryIssues[name]; issue != nil && strings.Contains(issue.Error(), "startup recovery deadline reached") {
+			timedOut++
+		}
+	}
+	if prepared != 1 || timedOut != 1 {
+		t.Fatalf("partway deadline prepared=%d timedOut=%d issues=%#v", prepared, timedOut, driver.recoveryIssues)
+	}
+	if probe.count() != 0 {
+		t.Fatalf("deadline path probed %d mounts", probe.count())
+	}
+	if mounts, unmounts, lazy := client.counts(); mounts+unmounts+lazy != 0 {
+		t.Fatalf("deadline path invoked connector: %d/%d/%d", mounts, unmounts, lazy)
+	}
 }
 
 func TestPrepareMountpointPreservesExistingContentsAndRejectsIncompatibleObjects(t *testing.T) {
