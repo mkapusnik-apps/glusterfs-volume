@@ -29,9 +29,11 @@ that tag. The build action's multi-platform index digest is inspected, exactly
 one `linux/amd64` and one `linux/arm64` manifest digest are selected, and each
 root filesystem is pulled and exported by its platform-specific digest.
 
-All third-party and GitHub-maintained actions are pinned to reviewed full commit
-SHAs. Their corresponding release versions remain in YAML comments so updates
-can be reviewed explicitly.
+All third-party and GitHub-maintained actions are pinned to their latest stable
+major-version tag (`@vN`). This accepts compatible upstream updates within the
+selected major automatically, including security fixes, but a movable major tag
+does not provide the supply-chain immutability of a reviewed full commit SHA.
+Major-version upgrades remain explicit repository changes.
 
 ## Troubleshooting
 
