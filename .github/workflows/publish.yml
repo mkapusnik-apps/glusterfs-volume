@@ -58,6 +58,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ghcr.io/${{ steps.meta.outputs.repository }}:source-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.tag }}
           build-args: |
             VERSION=${{ steps.meta.outputs.tag }}
             VCS_REF=${{ github.sha }}

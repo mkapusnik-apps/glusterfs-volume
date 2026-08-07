@@ -14,20 +14,23 @@ the same pull request cancels an older in-progress validation run.
 ## Publish Docker Plugin
 
 `workflows/publish.yml` runs only after a push to `master`. It builds the
-`linux/amd64` and `linux/arm64` source images, publishes an immutable source-SHA
-image, packages architecture-specific Docker plugins, and publishes an annotated
-multi-architecture plugin manifest.
+`linux/amd64` and `linux/arm64` source images, publishes them under a
+SHA-addressed `source-<sha>` tag, packages architecture-specific Docker plugins,
+and publishes an annotated multi-architecture plugin manifest.
 
 Publishing requires the workflow-provided GitHub token with `packages: write`.
-No repository secret is required. The immutable `source-<sha>` image retains OCI
-source, revision, and version labels; the plugin binary reports its version and
-revision during startup. Publish runs for `master` are serialized to prevent
-concurrent updates of the mutable architecture and `latest` tags.
+No repository secret is required. The build action applies OCI source, exact
+revision, and workflow-computed version labels independently of Dockerfile
+support. `VERSION` and `VCS_REF` are also passed as compatibility build arguments
+for Dockerfiles that consume them; publication does not depend on those arguments
+and the workflow makes no guarantee about binary-visible version output. Publish
+runs for `master` are serialized to prevent concurrent updates of mutable tags.
 
-The source tag is retained for operators, but plugin packaging does not resolve
-that tag. The build action's multi-platform index digest is inspected, exactly
-one `linux/amd64` and one `linux/arm64` manifest digest are selected, and each
-root filesystem is pulled and exported by its platform-specific digest.
+The `source-<sha>` tag is retained for operators, but it remains mutable like any
+registry tag and plugin packaging does not resolve it. The immutable identity is
+the build-produced multi-platform index digest. That index is inspected, exactly
+one `linux/amd64` and one `linux/arm64` child digest are selected, and each root
+filesystem is pulled and exported by its platform-specific digest.
 
 All third-party and GitHub-maintained actions are pinned to their latest stable
 major-version tag (`@vN`). This accepts compatible upstream updates within the
