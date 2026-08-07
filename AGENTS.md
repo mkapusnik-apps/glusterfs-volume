@@ -81,11 +81,8 @@ Notes:
 - Stale FUSE mounts: unmount and retry; ensure CAP_SYS_ADMIN and /dev/fuse are present
 
 ## CI
-- PR validation checks formatting, vetting, tests, and amd64/arm64 builds.
-- A push to `master` publishes the multi-architecture plugin through GHCR.
-- Remote GitHub Actions use current stable major-version tags (`@vN`).
-- See [`.github/workflows.md`](.github/workflows.md) for triggers, permissions,
-  publishing behavior, pinning tradeoffs, and troubleshooting.
+- Lint and typecheck on PRs
+- Build plugin image
 
 ## Supported Architectures
 - x86_64
