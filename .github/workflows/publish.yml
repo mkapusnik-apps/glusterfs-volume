@@ -3,38 +3,127 @@ name: Publish Docker Plugin
 on:
   push:
     branches:
+      - develop
       - master
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 concurrency:
-  group: publish-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  queue: max
+
+env:
+  IMAGE_REPOSITORY: ghcr.io/mkapusnik-apps/glusterfs-volume
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - name: Compute plugin name
+      - name: Select and reserve publication version
+        id: version
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ github.token }}
+          result-encoding: string
+          script: |
+            if (context.ref === 'refs/heads/develop') {
+              return 'latest';
+            }
+
+            if (context.ref !== 'refs/heads/master') {
+              throw new Error(`Ref ${context.ref} is not a supported publication branch`);
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const sha = context.sha;
+            const versionPattern = /^refs\/tags\/1\.(0|[1-9]\d*)\.0$/;
+            const maxAttempts = 20;
+
+            const describeError = (error) => {
+              const status = error.status ? `${error.status} ` : '';
+              const docs = error.documentation_url ? ` (${error.documentation_url})` : '';
+              return `${status}${error.message}${docs}`;
+            };
+
+            const readVersionRefs = async () => {
+              try {
+                return await github.paginate(github.rest.git.listMatchingRefs, {
+                  owner,
+                  repo,
+                  ref: 'tags/1.',
+                  per_page: 100,
+                });
+              } catch (error) {
+                throw new Error(`Failed to read repository version tags: ${describeError(error)}`);
+              }
+            };
+
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+              const refs = await readVersionRefs();
+              const minors = refs
+                .map((entry) => entry.ref.match(versionPattern))
+                .filter((match) => match !== null)
+                .map((match) => Number(match[1]));
+
+              if (minors.some((minor) => !Number.isSafeInteger(minor))) {
+                throw new Error('A repository version tag has a minor outside the safe integer range');
+              }
+
+              const nextMinor = minors.length === 0 ? 0 : Math.max(...minors) + 1;
+              if (!Number.isSafeInteger(nextMinor)) {
+                throw new Error('The next repository version minor is outside the safe integer range');
+              }
+
+              const version = `1.${nextMinor}.0`;
+              const ref = `refs/tags/${version}`;
+
+              try {
+                const created = await github.rest.git.createRef({ owner, repo, ref, sha });
+                if (created.data.ref !== ref || created.data.object.sha !== sha) {
+                  throw new Error(`GitHub returned unexpected data after creating ${ref}`);
+                }
+                core.info(`Reserved ${version} at ${sha} on attempt ${attempt}`);
+                return version;
+              } catch (error) {
+                if (error.status !== 409 && error.status !== 422) {
+                  throw new Error(`Failed to reserve ${ref}: ${describeError(error)}`);
+                }
+
+                try {
+                  await github.rest.git.getRef({ owner, repo, ref: `tags/${version}` });
+                } catch (verificationError) {
+                  throw new Error(
+                    `Reservation of ${ref} was rejected, but a collision could not be verified: `
+                    + `${describeError(verificationError)}; original error: ${describeError(error)}`,
+                  );
+                }
+
+                core.warning(`${ref} was reserved concurrently; refetching version state`);
+              }
+            }
+
+            throw new Error(`Unable to reserve a version after ${maxAttempts} verified collisions`);
+
+      - name: Compute publication metadata
         id: meta
+        env:
+          VERSION: ${{ steps.version.outputs.result }}
         run: |
-          REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          if [ "${{ github.ref_name }}" = "master" ]; then
-            TAG=latest
-          else
-            TAG=$(echo "${{ github.ref_name }}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g' | sed -E 's/^-+|-+$//g')
-          fi
+          set -euo pipefail
+          test -n "$VERSION"
           {
-            echo "tag=${TAG}"
-            echo "repository=${REPO}"
-            echo "plugin=${REPO}:${TAG}"
+            echo "version=${VERSION}"
+            echo "plugin=${IMAGE_REPOSITORY}:${VERSION}"
+            echo "source_tag=source-${GITHUB_SHA}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
@@ -57,20 +146,77 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/${{ steps.meta.outputs.repository }}:source-${{ github.sha }}
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ steps.meta.outputs.source_tag }}
           labels: |
+            org.opencontainers.image.title=glusterfs-volume
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.meta.outputs.tag }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.ref.name=${{ steps.meta.outputs.source_tag }}
           build-args: |
-            VERSION=${{ steps.meta.outputs.tag }}
+            VERSION=${{ steps.meta.outputs.version }}
             VCS_REF=${{ github.sha }}
 
+      - name: Check mutable publication currency
+        id: currency
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ github.token }}
+          result-encoding: string
+          script: |
+            if (context.ref !== 'refs/heads/develop') {
+              return 'true';
+            }
+
+            let branch;
+            try {
+              branch = await github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: 'develop',
+              });
+            } catch (error) {
+              const status = error.status ? `${error.status} ` : '';
+              throw new Error(`Failed to verify the develop branch head: ${status}${error.message}`);
+            }
+
+            if (branch.data.commit.sha !== context.sha) {
+              core.notice(
+                `Skipping stale latest publication for ${context.sha}; `
+                + `develop is now ${branch.data.commit.sha}`,
+              );
+              return 'false';
+            }
+
+            return 'true';
+
+      - name: Protect immutable master plugin tags
+        if: github.ref_name == 'master'
+        env:
+          PLUGIN_BASE: ${{ steps.meta.outputs.plugin }}
+        run: |
+          set -euo pipefail
+          for PLUGIN in "$PLUGIN_BASE" "${PLUGIN_BASE}-amd64" "${PLUGIN_BASE}-arm64"; do
+            if INSPECT_OUTPUT=$(docker manifest inspect "$PLUGIN" 2>&1); then
+              echo "Refusing to overwrite existing immutable plugin tag ${PLUGIN}" >&2
+              exit 1
+            fi
+
+            case "$INSPECT_OUTPUT" in
+              *"manifest unknown"*|*"no such manifest"*) ;;
+              *)
+                echo "Could not prove that immutable plugin tag ${PLUGIN} is unused:" >&2
+                echo "$INSPECT_OUTPUT" >&2
+                exit 1
+                ;;
+            esac
+          done
+
       - name: Build and push plugin packages
+        if: steps.currency.outputs.result == 'true'
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-          IMAGE_REPOSITORY: ghcr.io/${{ steps.meta.outputs.repository }}
-          PLUGIN_BASE: ghcr.io/${{ steps.meta.outputs.plugin }}
+          PLUGIN_BASE: ${{ steps.meta.outputs.plugin }}
         run: |
           set -euo pipefail
           test -n "$IMAGE_DIGEST"
@@ -103,8 +249,11 @@ jobs:
           done
 
       - name: Create multi-arch plugin manifest
+        if: steps.currency.outputs.result == 'true'
+        env:
+          PLUGIN: ${{ steps.meta.outputs.plugin }}
         run: |
-          PLUGIN="ghcr.io/${{ steps.meta.outputs.plugin }}"
+          set -euo pipefail
           docker manifest create \
             "$PLUGIN" \
             "${PLUGIN}-amd64" \
