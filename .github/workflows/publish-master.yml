@@ -1,0 +1,80 @@
+name: Publish Master Docker Plugin
+
+on:
+  push:
+    branches:
+      - master
+
+permissions: {}
+
+concurrency:
+  group: master-plugin-publication
+  queue: max
+
+env:
+  IMAGE_REPOSITORY: ghcr.io/mkapusnik-apps/glusterfs-volume
+  SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+
+jobs:
+  publication:
+    name: Master plugin publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Reserve immutable publication version
+        id: version
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ github.token }}
+          result-encoding: string
+          script: |
+            const reserve = require('./.github/scripts/reserve-version.js');
+            return await reserve({ github, context, core });
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push exact-SHA multi-arch image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_REPOSITORY }}:source-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.title=glusterfs-volume
+            org.opencontainers.image.source=${{ env.SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.result }}
+            org.opencontainers.image.ref.name=source-${{ github.sha }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.result }}
+            VCS_REF=${{ github.sha }}
+
+      - name: Publish immutable plugin packages
+        uses: ./.github/actions/publish-plugin
+        with:
+          image-repository: ${{ env.IMAGE_REPOSITORY }}
+          image-digest: ${{ steps.build.outputs.digest }}
+          plugin-base: >-
+            ${{ env.IMAGE_REPOSITORY }}:${{ steps.version.outputs.result }}
+          protect-immutable: 'true'

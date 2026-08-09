@@ -1,0 +1,104 @@
+name: Publish Docker plugin packages
+description: Package per-architecture Docker plugins and publish their manifest.
+
+inputs:
+  image-repository:
+    description: Source image repository without a tag or digest.
+    required: true
+  image-digest:
+    description: Build-produced multi-platform source image digest.
+    required: true
+  plugin-base:
+    description: Fully qualified final plugin reference.
+    required: true
+  protect-immutable:
+    description: Fail unless the final and architecture plugin tags are unused.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Protect immutable plugin tags
+      if: inputs.protect-immutable == 'true'
+      shell: bash
+      env:
+        PLUGIN_BASE: ${{ inputs.plugin-base }}
+      run: |
+        set -euo pipefail
+        for PLUGIN in \
+          "$PLUGIN_BASE" \
+          "${PLUGIN_BASE}-amd64" \
+          "${PLUGIN_BASE}-arm64"
+        do
+          if INSPECT_OUTPUT=$(docker manifest inspect "$PLUGIN" 2>&1); then
+            echo \
+              "Refusing to overwrite existing immutable plugin tag ${PLUGIN}" \
+              >&2
+            exit 1
+          fi
+
+          case "$INSPECT_OUTPUT" in
+            *"manifest unknown"*|*"no such manifest"*) ;;
+            *)
+              echo \
+                "Could not prove immutable plugin tag ${PLUGIN} is unused:" \
+                >&2
+              echo "$INSPECT_OUTPUT" >&2
+              exit 1
+              ;;
+          esac
+        done
+
+    - name: Build and push architecture plugin packages
+      shell: bash
+      env:
+        IMAGE_DIGEST: ${{ inputs.image-digest }}
+        IMAGE_REPOSITORY: ${{ inputs.image-repository }}
+        PLUGIN_BASE: ${{ inputs.plugin-base }}
+      run: |
+        set -euo pipefail
+        test -n "$IMAGE_DIGEST"
+        INDEX_IMAGE="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+        INDEX_JSON="$(docker buildx imagetools inspect --raw "$INDEX_IMAGE")"
+        for ARCH in amd64 arm64; do
+          PLATFORM_DIGEST="$(
+            jq -er --arg arch "$ARCH" '
+              [.manifests[] | select(
+                .platform.os == "linux" and .platform.architecture == $arch
+              )]
+              | if length == 1 then .[0].digest
+                else error("expected exactly one linux/" + $arch + " manifest")
+                end
+            ' <<< "$INDEX_JSON"
+          )"
+          IMAGE="${IMAGE_REPOSITORY}@${PLATFORM_DIGEST}"
+          PLUGIN="${PLUGIN_BASE}-${ARCH}"
+          echo "Packaging linux/${ARCH} from ${IMAGE}"
+          rm -rf plugin/rootfs
+          mkdir -p plugin/rootfs
+          docker pull --platform "linux/${ARCH}" "$IMAGE"
+          CID=$(docker create --platform "linux/${ARCH}" "$IMAGE")
+          docker export "$CID" | tar -x -C plugin/rootfs
+          docker rm -f "$CID"
+          cp config.json plugin/
+          docker plugin create "$PLUGIN" ./plugin
+          docker plugin push "$PLUGIN"
+          docker plugin rm -f "$PLUGIN" || true
+        done
+
+    - name: Create multi-architecture plugin manifest
+      shell: bash
+      env:
+        PLUGIN: ${{ inputs.plugin-base }}
+      run: |
+        set -euo pipefail
+        docker manifest create \
+          "$PLUGIN" \
+          "${PLUGIN}-amd64" \
+          "${PLUGIN}-arm64"
+        docker manifest annotate \
+          "$PLUGIN" "${PLUGIN}-amd64" --os linux --arch amd64
+        docker manifest annotate \
+          "$PLUGIN" "${PLUGIN}-arm64" --os linux --arch arm64
+        docker manifest push --purge "$PLUGIN"
