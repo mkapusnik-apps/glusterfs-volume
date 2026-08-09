@@ -3,6 +3,9 @@
 ## Overview
 Docker volume plugin that provisions Docker volumes of a GlusterFS volume. The plugin runs in a container with FUSE.
 
+Runtime startup reconciliation, mount recovery, reference behavior, diagnostics, and
+artifact provenance are documented in [Runtime recovery](docs/runtime-recovery.md).
+
 ## Installation
 
 Install the current `develop` publication through the intentionally mutable

@@ -1,0 +1,25 @@
+{
+  "runtimes": {
+    "go": {
+      "image": "golang:1.20-bullseye",
+      "allowedExecutables": ["go", "gofmt", "make"],
+      "environment": {
+        "GOCACHE": "/app/.cache/go-build",
+        "GOMODCACHE": "/app/.cache/go-mod"
+      },
+      "timeoutSec": 900
+    },
+    "go-arm64": {
+      "image": "golang:1.20-bullseye",
+      "allowedExecutables": ["go"],
+      "environment": {
+        "CGO_ENABLED": "0",
+        "GOARCH": "arm64",
+        "GOOS": "linux",
+        "GOCACHE": "/app/.cache/go-build",
+        "GOMODCACHE": "/app/.cache/go-mod"
+      },
+      "timeoutSec": 900
+    }
+  }
+}

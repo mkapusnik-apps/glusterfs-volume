@@ -2,9 +2,11 @@ PLUGIN ?= glusterfs-volume
 REGISTRY ?=
 CONTEXT ?= default
 DOCKER ?= docker
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || printf dev)
+VCS_REF ?= $(shell git rev-parse --verify HEAD 2>/dev/null || printf unknown)
 
 PLUGIN_NAME := $(REGISTRY)$(PLUGIN)
-GO_SOURCES := $(shell ls *.go)
+GO_SOURCES := $(shell find . -type f -name '*.go' -print)
 
 .PHONY: all build image plugin clean push
 
@@ -15,12 +17,17 @@ bin/linux/docker-volume-glusterfs: $(GO_SOURCES)
 	@mkdir -p bin/linux
 	@DOCKER_BUILDKIT=1 \
 	  $(DOCKER) --context $(CONTEXT) build \
+	  --build-arg VERSION=$(VERSION) \
+	  --build-arg VCS_REF=$(VCS_REF) \
 	  --target artifact \
 	  -o type=local,dest=bin/linux .
 
 image: bin/linux/docker-volume-glusterfs
 	@echo "[MAKE] Building plugin image $(PLUGIN_NAME)"
-	@DOCKER_BUILDKIT=1 $(DOCKER) --context $(CONTEXT) build -t $(PLUGIN_NAME) .
+	@DOCKER_BUILDKIT=1 $(DOCKER) --context $(CONTEXT) build \
+	  --build-arg VERSION=$(VERSION) \
+	  --build-arg VCS_REF=$(VCS_REF) \
+	  -t $(PLUGIN_NAME) .
 
 plugin: image
 	@echo "[MAKE] Creating rootfs"

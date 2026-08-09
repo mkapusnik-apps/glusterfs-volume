@@ -1,4 +1,4 @@
-package main
+package plugin
 
 import (
 	"errors"
@@ -39,27 +39,39 @@ func parseGfsName(raw string) (string, string, error) {
 	if raw == "" {
 		return "", "", errors.New("glusterfs name is required")
 	}
-	trimmed := strings.Trim(raw, "/")
-	parts := strings.Split(trimmed, "/")
+	if strings.Trim(raw, "/") != raw || strings.ContainsRune(raw, '\\') || containsControl(raw) {
+		return "", "", errors.New("glusterfs name must be a relative slash-separated path")
+	}
+	parts := strings.Split(raw, "/")
 	if len(parts) == 0 || parts[0] == "" {
 		return "", "", errors.New("invalid glusterfs name")
 	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return "", "", errors.New("invalid glusterfs path component")
+		}
+	}
 	volume := parts[0]
+	if err := validateGlusterComponent(volume, "volume"); err != nil {
+		return "", "", err
+	}
 	if len(parts) == 1 {
 		return volume, "", nil
 	}
-	return volume, strings.Join(parts[1:], "/"), nil
+	subdir := strings.Join(parts[1:], "/")
+	if err := validateSubdirectory(subdir); err != nil {
+		return "", "", err
+	}
+	return volume, subdir, nil
 }
 
 func ensureDirPath(path string, mode os.FileMode) error {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err == nil {
 		if info.IsDir() {
 			return nil
 		}
-		if err := os.Remove(path); err != nil {
-			return err
-		}
+		return errors.New("path exists and is not a directory")
 	} else if !os.IsNotExist(err) {
 		return err
 	}
