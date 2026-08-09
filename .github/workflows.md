@@ -1,95 +1,157 @@
 # GitHub Actions workflows
 
-## PR Validation
+## PR validation
 
 `workflows/validate.yml` runs for pull requests targeting `develop` or `master`.
-Its single `Go validation` job checks formatting, runs `go vet` and the existing
-Go test suite, builds natively on the hosted amd64 runner, and cross-builds for
+Its `Go validation` job checks formatting, runs `go vet` and the existing Go
+test suite, builds natively on the hosted amd64 runner, and cross-builds for
 `linux/arm64` with CGO disabled.
 
 The workflow has read-only repository permission, persists no checkout token,
-does not use secrets, and never publishes artifacts or packages. A newer run for
-the same pull request cancels an older in-progress validation run.
+does not use secrets, and never publishes artifacts or packages. A newer run
+for the same pull request cancels an older in-progress validation run.
 
-## Publish Docker Plugin
+## Develop publication and promotion
 
-`workflows/publish.yml` runs after pushes to `develop` and `master`. It publishes
-only to `ghcr.io/mkapusnik-apps/glusterfs-volume`. Each run builds the
-`linux/amd64` and `linux/arm64` source images and publishes them under a
-SHA-addressed `source-<sha>` tag. Current publication runs then package
-architecture-specific Docker plugins and publish an annotated multi-architecture
-plugin manifest.
+`workflows/publish-develop.yml` runs only after pushes to `develop`. The
+`Develop plugin publication` job builds the exact pushed commit for
+`linux/amd64` and `linux/arm64` and publishes its source index as
+`ghcr.io/mkapusnik-apps/glusterfs-volume:source-<full-sha>`. If the pushed SHA
+is still the live `develop` head immediately before mutable publication, the
+job packages and updates `latest-amd64`, `latest-arm64`, and their annotated
+multi-architecture `latest` manifest. A queued run whose SHA is already stale
+keeps its exact-SHA source artifact but skips all `latest` tags.
 
-`develop` updates the intentionally mutable `latest`, `latest-amd64`, and
-`latest-arm64` plugin tags. `master` reserves and publishes an immutable
-`1.<minor>.0` set consisting of the final tag and matching `-amd64` and `-arm64`
-tags. The first version is `1.0.0` when no exact, canonical `1.<minor>.0`
-repository tag exists. Each subsequent master run increments the greatest valid
-minor.
+The job checks the live head again after all three mutable tags are complete.
+Only a successful publication that remains current can run the promotion job.
+That job checks the head again before PR operations, does nothing when
+`develop` has no commits to promote to `master`, and creates or reuses only the
+exact open `develop` to `master` pull request. Its title is
+`Promote develop to master`; its body is refreshed with the full successfully
+published SHA. Closed or merged PRs are not reused, and an existing draft or
+ambiguous duplicate open PR fails visibly instead of being made promotable.
 
-The master version is reserved before the image build by atomically creating a
-lightweight repository Git tag at the workflow's exact build SHA. Existing
-version tags are never updated or overwritten. A create collision is verified,
-all version refs are fetched again, and allocation retries with the next minor;
-ambiguous or failed API operations stop publication. A failed run after
-reservation can therefore consume a version without publishing all plugin tags.
-These intentional version gaps preserve immutable durable state and must not be
-filled by moving or reusing a tag.
+The promotion job uses `secrets.PAT_ACTIONS`, not `GITHUB_TOKEN`, so PR-created
+and PR-synchronize events start validation autonomously. The token must be able
+to read repository contents, create and update repository pull requests, and
+enable pull request auto-merge. Store only the token value in the repository
+Actions secret named `PAT_ACTIONS`.
 
-Publishing requires the workflow-provided GitHub token with `contents: write` to
-reserve master version tags and `packages: write` to publish to GHCR. No
-repository secret is required. The build action applies OCI title, source, exact
-revision, version, and source-tag reference labels independently of Dockerfile
-support. `VERSION` and `VCS_REF` are also passed as compatibility build arguments
-for Dockerfiles that consume them; publication does not depend on those arguments
-and the workflow makes no guarantee about binary-visible version output.
+Promotion enables auto-merge with the merge-commit method. It never uses an
+administrator merge or bypasses checks, reviews, merge queues, or other branch
+rules. Reruns update the same exact-pair PR and accept merge-commit auto-merge
+that is already enabled. A PR already configured with another auto-merge method
+fails visibly. A create race is recovered only when exactly one matching open
+non-draft PR can be proved. Failure to create or update the PR, or to enable and
+verify auto-merge, fails the workflow after publication; it does not delete or
+roll back the published plugin. Correct the token, repository setting, draft,
+or API problem and rerun the failed workflow.
 
-Runs are serialized independently per publication branch, with queueing enabled
-so newer pushes do not replace already queued builds. GitHub currently retains up
-to 100 queued runs per concurrency group. Because GitHub does not guarantee
-dispatch order, a queued `develop` run rechecks the live branch head after its
-SHA-addressed image build and skips mutable plugin publication when superseded.
-This prevents an older build from overwriting `latest` while still retaining the
-run and its source image. `develop` and immutable `master` releases use separate
-queues and can proceed independently.
+### Required repository settings
 
-Before a master build pushes plugin packages, it verifies that the selected final
-and architecture tags do not already exist. An existing tag, registry permission
-failure, or ambiguous registry response fails closed rather than risking an
-overwrite. `latest` intentionally skips this protection.
+Repository administrators must enable **Allow auto-merge** and keep the
+**Create a merge commit** merge method available. The rule protecting
+`master` must require these exact GitHub Actions check names:
 
-The `source-<sha>` tag is retained for operators, but it remains mutable like any
-registry tag and plugin packaging does not resolve it. The immutable identity is
-the build-produced multi-platform index digest. That index is inspected, exactly
-one `linux/amd64` and one `linux/arm64` child digest are selected, and each root
-filesystem is pulled and exported by its platform-specific digest.
+- `Develop plugin publication`
+- `Go validation`
 
-All third-party and GitHub-maintained actions are pinned to their latest stable
-major-version tag (`@vN`). This accepts compatible upstream updates within the
-selected major automatically, including security fixes, but a movable major tag
-does not provide the supply-chain immutability of a reviewed full commit SHA.
-Major-version upgrades remain explicit repository changes.
+The publication context is intentionally a stable job name and is attached to
+the exact `develop` commit built by the push workflow. Requiring it prevents an
+already auto-merge-enabled promotion PR from merging after `develop` advances
+to a newer, not-yet-published SHA. `Go validation` supplies the independent PR
+validation gate. Required reviews and other existing repository or organization
+rules remain in force.
+
+`PAT_ACTIONS`, auto-merge, merge commits, and a required status context written
+by name through the branch protection or rules API can be configured before
+these workflow files merge. The GitHub settings UI may not offer
+`Develop plugin publication` until that check has run once. If so, add it by
+API before merging this change, or add it immediately after the first develop
+publication and do not allow the generated promotion PR to merge first. The
+API configuration is safely fail-closed before the first check exists: the
+promotion cannot merge until the exact head supplies it.
+
+After auto-merge completes, verify that `master` points to the expected merge
+commit, its parents include the full published develop SHA, the master
+publication workflow reserved a new repository `1.<minor>.0` tag at that merge
+commit, and the matching final, `-amd64`, and `-arm64` GHCR plugin tags exist.
+
+## Master publication
+
+`workflows/publish-master.yml` runs only after pushes to `master` and never
+updates `latest`. Before building, it atomically reserves an immutable
+`1.<minor>.0` repository Git tag at the exact master SHA. The first version is
+`1.0.0` when no exact canonical tag exists; each subsequent run increments the
+greatest valid minor. It then publishes the exact-SHA source image and matching
+versioned final, `-amd64`, and `-arm64` plugin tags.
+
+Reservation collisions are verified, all version refs are fetched again, and
+allocation retries with the next minor. Ambiguous or failed API operations stop
+publication. Existing plugin tags also fail the immutable preflight closed
+rather than being overwritten. A failure after reservation can therefore leave
+an intentional version gap. Never move or reuse that repository tag; resolve
+the failure and rerun so the next minor is reserved.
+
+The master workflow uses `GITHUB_TOKEN` with `contents: write` for version tag
+reservation and `packages: write` for GHCR. It does not use `PAT_ACTIONS` and
+does not create pull requests.
+
+## Publication implementation and concurrency
+
+Both publication workflows publish only to
+`ghcr.io/mkapusnik-apps/glusterfs-volume`. The shared local
+`.github/actions/publish-plugin` composite action resolves the build-produced
+multi-platform index digest, requires exactly one Linux child for each supported
+architecture, exports those root filesystems, publishes architecture plugin
+packages, and creates the final annotated plugin manifest. Plugin packaging
+uses digests rather than resolving the mutable source tag.
+
+Develop and master use stable, separate concurrency groups. `queue: max` keeps
+up to 100 waiting runs in each group instead of replacing pending runs; GitHub
+does not guarantee queue dispatch order. The develop live-head checks prevent a
+run that is stale when it reaches a mutable or promotion gate from changing
+`latest` or promotion state. Master versions remain safe under any dispatch
+order because reservation and destination tags are immutable and fail closed.
+
+The `source-<sha>` tag is an operator-facing exact-SHA reference but, like any
+registry tag, is technically mutable. Its immutable build identity is the
+build-produced index digest. OCI title, source, exact revision, version, and
+source-tag labels are applied independently of Dockerfile support; `VERSION`
+and `VCS_REF` are also supplied as compatibility build arguments.
+
+The shared `mkapusnik-apps/commons/pull-request@v1` action is intentionally not
+used for promotion. Its current implementation updates existing draft PRs,
+does not provide the required no-diff no-op, and invokes the auto-merge mutation
+without first handling already-enabled auto-merge. The repository script
+implements only the stricter exact-pair promotion behavior.
+
+All remote actions use their current stable major-version tag (`@vN`). This
+accepts compatible upstream updates within a major, including security fixes,
+but does not have the supply-chain immutability of a reviewed commit SHA. Major
+upgrades remain explicit repository changes.
 
 ## GHCR package settings
 
 GHCR package visibility and repository access cannot be declared in workflow
-files. After the first publication, an organization owner must open the package
-settings for `mkapusnik-apps/glusterfs-volume` and set visibility to **Public** if
-the unauthenticated install command in the README is intended to work. If the
-package does not inherit access from its linked repository, its **Manage Actions
-access** list must grant `mkapusnik-apps/glusterfs-volume` **Write** access before
-publication can succeed.
+files. After the first publication, an organization owner must set the
+`mkapusnik-apps/glusterfs-volume` package to **Public** if the unauthenticated
+README installation commands should work. If the package does not inherit
+access from its linked repository, **Manage Actions access** must grant this
+repository **Write** access before publication can succeed.
 
 ## Troubleshooting
 
 - A formatting failure includes the working-tree diff produced by `go fmt`.
-- Vet, test, or build failures should be reproduced with the command shown by the
-  failing step using Go 1.20.
-- An arm64-only failure indicates a cross-platform compile issue; that step does
-  not execute the arm64 binary.
-- Publish failures should be checked for GHCR permission errors, QEMU or Buildx
-  setup failures, version-tag reservation errors, immutable-tag preflight errors,
-  and correct platform annotations on the final plugin manifest.
-- Never move an existing `1.<minor>.0` Git tag or reuse a version left by a failed
-  master run. Resolve API or package permission failures and let the next run
-  reserve the next minor.
+- Vet, test, or build failures should be reproduced with the command shown by
+  the failing step using Go 1.20. An arm64 build does not execute the binary.
+- Develop source publication with no `latest` update means the run lost a
+  live-head check. Inspect the newer queued develop run instead of rerunning the
+  stale SHA.
+- A promotion failure leaves published artifacts intact. Check `PAT_ACTIONS`,
+  repository auto-merge and merge-commit settings, the exact open PR's draft
+  and auto-merge state, and the required master checks before rerunning.
+- Publish failures should be checked for GHCR access, QEMU or Buildx setup,
+  version reservation, immutable-tag preflight, and final manifest platform
+  annotations.
+- Never fill a master version gap by moving an existing `1.<minor>.0` tag.

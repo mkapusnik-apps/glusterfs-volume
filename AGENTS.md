@@ -82,15 +82,20 @@ Notes:
 
 ## CI
 - PR validation checks formatting, vetting, tests, and amd64/arm64 builds.
-- Pushes to `develop` publish the mutable `latest` multi-architecture plugin to
-  `ghcr.io/mkapusnik-apps/glusterfs-volume`.
+- Pushes to `develop` publish an exact-SHA source image and update the mutable
+  `latest` multi-architecture plugin only while that SHA remains the branch
+  head. A completed current publication maintains an auto-merge promotion pull
+  request from `develop` to `master`.
 - Pushes to `master` reserve immutable `1.<minor>.0` repository tags and publish
   matching versioned multi-architecture plugins. Publication is serialized per
   branch without discarding queued builds.
+- Promotion requires the `PAT_ACTIONS` secret and repository auto-merge. The
+  `master` rules must require both `Develop plugin publication` and
+  `Go validation`; automation does not bypass checks, reviews, or rules.
 - Remote GitHub Actions use current stable major-version tags (`@vN`).
 - See [`.github/workflows.md`](.github/workflows.md) for triggers, permissions,
-  version reservation, package settings, publishing behavior, pinning tradeoffs,
-  and troubleshooting.
+  promotion settings, version reservation, publishing behavior, recovery, and
+  troubleshooting.
 
 ## Supported Architectures
 - x86_64
