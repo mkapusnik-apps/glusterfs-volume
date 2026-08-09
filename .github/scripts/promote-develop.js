@@ -76,14 +76,8 @@ module.exports = async ({ github, context, core }) => {
   const comparison = await github.rest.repos.compareCommitsWithBasehead({
     owner,
     repo,
-    basehead: `${BASE}...${HEAD}`,
+    basehead: `${BASE}...${publishedSha}`,
   });
-  if (comparison.data.head_commit.sha !== publishedSha) {
-    core.notice(
-      `Skipping stale promotion for ${publishedSha}; comparison used ${comparison.data.head_commit.sha}`,
-    );
-    return 'stale';
-  }
   if (comparison.data.ahead_by === 0) {
     core.info(`${HEAD} has no changes to promote to ${BASE}`);
     return 'no-diff';
