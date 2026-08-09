@@ -81,8 +81,16 @@ Notes:
 - Stale FUSE mounts: unmount and retry; ensure CAP_SYS_ADMIN and /dev/fuse are present
 
 ## CI
-- Lint and typecheck on PRs
-- Build plugin image
+- PR validation checks formatting, vetting, tests, and amd64/arm64 builds.
+- Pushes to `develop` publish the mutable `latest` multi-architecture plugin to
+  `ghcr.io/mkapusnik-apps/glusterfs-volume`.
+- Pushes to `master` reserve immutable `1.<minor>.0` repository tags and publish
+  matching versioned multi-architecture plugins. Publication is serialized per
+  branch without discarding queued builds.
+- Remote GitHub Actions use current stable major-version tags (`@vN`).
+- See [`.github/workflows.md`](.github/workflows.md) for triggers, permissions,
+  version reservation, package settings, publishing behavior, pinning tradeoffs,
+  and troubleshooting.
 
 ## Supported Architectures
 - x86_64
