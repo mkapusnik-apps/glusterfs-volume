@@ -147,7 +147,10 @@ Published container images also expose `org.opencontainers.image.version`,
 `org.opencontainers.image.revision`, and `org.opencontainers.image.source` labels.
 The publishing workflow passes the GitHub source SHA as the revision for both
 architectures. It first publishes the labeled image under the immutable
-`source-<full SHA>` tag, then creates both architecture-specific plugin packages from
-that exact image and annotates the final plugin manifest entries as `linux/amd64` and
-`linux/arm64`. Local `make` builds default to the current Git revision and the output of
-`git describe`; callers can override `VCS_REF` and `VERSION` explicitly.
+`source-<full SHA>` tag, then creates and validates the `linux/amd64` and
+`linux/arm64` managed-plugin packages from that exact image. Docker managed-plugin
+users install and upgrade through the architecture-qualified packages described in
+[Installation and upgrade](installation.md); the publishing workflow does not create
+new unqualified managed-plugin manifest tags. Local `make` builds default to the
+current Git revision and the output of `git describe`; callers can override `VCS_REF`
+and `VERSION` explicitly.

@@ -61,7 +61,7 @@ Notes:
 - The script assumes Docker and Docker Compose; run it from the repo root.
 
 ## Multi-arch Builds
-- Current flow targets amd64, x86 and arm64
+- Current flow targets `linux/amd64` (x86_64) and `linux/arm64`
 - Use docker buildx and multi-arch base images
 - Add a Makefile target for buildx (platforms=linux/amd64,linux/arm64)
 - Verify gluster client base supports both architectures
@@ -83,12 +83,16 @@ Notes:
 ## CI
 - PR validation checks formatting, vetting, tests, and amd64/arm64 builds.
 - Pushes to `develop` publish an exact-SHA source image and update the mutable
-  `latest` multi-architecture plugin only while that SHA remains the branch
-  head. A completed current publication maintains an auto-merge promotion pull
-  request from `develop` to `master`.
+  `latest-amd64` and `latest-arm64` managed-plugin references only while that
+  SHA remains the branch head. A completed current publication maintains an
+  auto-merge promotion pull request from `develop` to `master`.
 - Pushes to `master` reserve immutable `1.<minor>.0` repository tags and publish
-  matching versioned multi-architecture plugins. Publication is serialized per
-  branch without discarding queued builds.
+  matching immutable `1.<minor>.0-amd64` and `1.<minor>.0-arm64`
+  managed-plugin references. Publication is serialized per branch without
+  discarding queued builds.
+- Publication validates each architecture-qualified managed-plugin artifact.
+  It does not publish unqualified multi-architecture managed-plugin manifest
+  tags; historical publications such as `1.1.0` remain unchanged.
 - Promotion requires the `PAT_ACTIONS` secret and repository auto-merge. The
   `master` rules must require both `Develop plugin publication` and
   `Go validation`; automation does not bypass checks, reviews, or rules.
